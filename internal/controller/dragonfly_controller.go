@@ -289,13 +289,13 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		// perform a rollout only if the pod spec has changed
 		// Check if the pod spec has changed
 		for _, pod := range pods.Items {
+			log.Info("Checking if pod spec has changed", "pod", fmt.Sprintf("%s/%s", pod.Namespace, pod.Name))
 			onLatestVersion, err := isPodOnLatestVersion(&pod, &statefulSet)
 			if err != nil {
 				log.Error(err, "could not check if pod is on latest version")
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 			}
 			if !onLatestVersion {
-				log.Info("Checking if pod spec has changed", "updatedReplicas", statefulSet.Status.UpdatedReplicas, "currentReplicas", statefulSet.Status.Replicas)
 				log.Info("Pod spec has changed, performing a rollout")
 				r.EventRecorder.Event(&df, corev1.EventTypeNormal, "Rollout", "Starting a rollout")
 
