@@ -170,7 +170,7 @@ func isPodReady(pod corev1.Pod) bool {
 
 func isPodMarkedForDeletion(pod corev1.Pod) bool {
 	for _, c := range pod.Status.Conditions {
-		if pod.DeletionTimestamp != nil && c.Type == corev1.DisruptionTarget && c.Status == corev1.ConditionTrue {
+		if pod.DeletionTimestamp != nil || (c.Type == corev1.DisruptionTarget && c.Status == corev1.ConditionTrue) {
 			return true
 		}
 	}
