@@ -180,24 +180,6 @@ func (r *DfPodLifeCycleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	return ctrl.Result{}, nil
 }
 
-func isPodReady(pod corev1.Pod) bool {
-	for _, c := range pod.Status.Conditions {
-		if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
-			return true
-		}
-	}
-	return false
-}
-
-func isPodMarkedForDeletion(pod corev1.Pod) bool {
-	for _, c := range pod.Status.Conditions {
-		if pod.DeletionTimestamp != nil && c.Type == corev1.DisruptionTarget && c.Status == corev1.ConditionTrue {
-			return true
-		}
-	}
-	return false
-}
-
 // SetupWithManager sets up the controller with the Manager.
 func (r *DfPodLifeCycleReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
