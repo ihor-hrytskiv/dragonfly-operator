@@ -296,7 +296,7 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 			}
 			if !onLatestVersion {
-				log.Info("Pod spec has changed, performing a rollout")
+				log.Info("Pod spec has changed, performing a rollout", "pod", fmt.Sprintf("%s/%s", pod.Namespace, pod.Name))
 				r.EventRecorder.Event(&df, corev1.EventTypeNormal, "Rollout", "Starting a rollout")
 
 				// Start rollout and update status
