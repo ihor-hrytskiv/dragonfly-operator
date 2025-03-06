@@ -57,15 +57,6 @@ func (r *DfPodLifeCycleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// check for pod readiness
-	isPodReady := false
-	for _, condition := range pod.Status.Conditions {
-		if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
-			isPodReady = true
-			break
-		}
-	}
-
 	dfi, err := GetDragonflyInstanceFromPod(ctx, r.Client, &pod, log)
 	if err != nil {
 		log.Info("Pod does not belong to a Dragonfly instance")
@@ -74,7 +65,7 @@ func (r *DfPodLifeCycleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	// Get the role of the pod
 	role, roleExists := pod.Labels[resources.Role]
-	if !isPodReady {
+	if !isPodReady(pod) {
 		if roleExists && role == "master" {
 			log.Info("Master pod is not ready, initiating failover", "pod", req.NamespacedName)
 			err := dfi.configureReplication(ctx)
@@ -147,7 +138,7 @@ func (r *DfPodLifeCycleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Replication", "Configured a new replica")
 			}
 		}
-	} else if pod.DeletionTimestamp != nil {
+	} else if isPodMarkedForDeletion(pod) {
 		// pod deletion event
 		// configure replication if its a master pod
 		// do nothing if its a replica pod
@@ -187,6 +178,24 @@ func (r *DfPodLifeCycleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func isPodReady(pod corev1.Pod) bool {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func isPodMarkedForDeletion(pod corev1.Pod) bool {
+	for _, c := range pod.Status.Conditions {
+		if pod.DeletionTimestamp != nil && c.Type == corev1.DisruptionTarget && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 // SetupWithManager sets up the controller with the Manager.
