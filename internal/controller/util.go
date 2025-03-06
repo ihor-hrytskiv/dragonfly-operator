@@ -158,3 +158,21 @@ func isStableState(ctx context.Context, pod *corev1.Pod) (bool, error) {
 
 	return true, nil
 }
+
+func isPodReady(pod corev1.Pod) bool {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func isPodMarkedForDeletion(pod corev1.Pod) bool {
+	for _, c := range pod.Status.Conditions {
+		if pod.DeletionTimestamp != nil || (c.Type == corev1.DisruptionTarget && c.Status == corev1.ConditionTrue) {
+			return true
+		}
+	}
+	return false
+}
