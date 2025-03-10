@@ -41,8 +41,7 @@ import (
 // DragonflyReconciler reconciles a Dragonfly object
 type DragonflyReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
-
+	Scheme        *runtime.Scheme
 	EventRecorder record.EventRecorder
 }
 

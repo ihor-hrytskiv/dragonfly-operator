@@ -19,6 +19,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"time"
 
 	"github.com/dragonflydb/dragonfly-operator/internal/resources"
@@ -28,7 +30,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
@@ -66,7 +67,16 @@ func (r *DfPodLifeCycleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 	}
 
-	dfi, err := GetDragonflyInstanceFromPod(ctx, r.Client, &pod, log)
+	dfName, ok := pod.Labels["app"]
+	if !ok {
+		log.Info("Failed to get Dragonfly name from pod labels")
+		return ctrl.Result{}, nil
+	}
+
+	dfi, err := getDragonflyInstance(ctx, types.NamespacedName{
+		Name:      dfName,
+		Namespace: pod.Namespace,
+	}, r, log)
 	if err != nil {
 		log.Info("Pod does not belong to a Dragonfly instance")
 		return ctrl.Result{}, nil
@@ -188,6 +198,12 @@ func (r *DfPodLifeCycleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	return ctrl.Result{}, nil
 }
+
+func (r *DfPodLifeCycleReconciler) GetClient() client.Client { return r.Client }
+
+func (r *DfPodLifeCycleReconciler) GetEventRecorder() record.EventRecorder { return r.EventRecorder }
+
+func (r *DfPodLifeCycleReconciler) GetScheme() *runtime.Scheme { return r.Scheme }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *DfPodLifeCycleReconciler) SetupWithManager(mgr ctrl.Manager) error {

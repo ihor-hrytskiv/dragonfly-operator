@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
 	"net"
 	"strconv"
 	"strings"
@@ -35,34 +37,38 @@ import (
 
 // DragonflyInstance is an abstraction over the `Dragonfly` CRD
 // and provides methods to handle replication.
-type DragonflyInstance struct {
-	// Dragonfly is the relevant Dragonfly CRD that it performs actions over
-	df *dfv1alpha1.Dragonfly
-
-	client client.Client
-	log    logr.Logger
-}
-
-func GetDragonflyInstanceFromPod(ctx context.Context, c client.Client, pod *corev1.Pod, log logr.Logger) (*DragonflyInstance, error) {
-	dfName, ok := pod.Labels["app"]
-	if !ok {
-		return nil, errors.New("can't find the `app` label")
+type (
+	Reconciler interface {
+		GetClient() client.Client
+		GetScheme() *runtime.Scheme
+		GetEventRecorder() record.EventRecorder
 	}
+	DragonflyInstance struct {
+		// Dragonfly is the relevant Dragonfly CRD that it performs actions over
+		df *dfv1alpha1.Dragonfly
 
+		client        client.Client
+		scheme        *runtime.Scheme
+		eventRecorder record.EventRecorder
+		log           logr.Logger
+	}
+)
+
+func getDragonflyInstance(ctx context.Context, namespacedName types.NamespacedName, reconciler Reconciler, log logr.Logger) (*DragonflyInstance, error) {
 	// Retrieve the relevant Dragonfly object
 	var df dfv1alpha1.Dragonfly
-	err := c.Get(ctx, types.NamespacedName{
-		Name:      dfName,
-		Namespace: pod.Namespace,
-	}, &df)
+	c := reconciler.GetClient()
+	err := c.Get(ctx, namespacedName, &df)
 	if err != nil {
 		return nil, err
 	}
 
 	return &DragonflyInstance{
-		df:     &df,
-		client: c,
-		log:    log,
+		df:            &df,
+		client:        c,
+		scheme:        reconciler.GetScheme(),
+		eventRecorder: reconciler.GetEventRecorder(),
+		log:           log,
 	}, nil
 }
 
