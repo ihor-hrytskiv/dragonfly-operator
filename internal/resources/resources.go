@@ -40,9 +40,9 @@ const (
 	TLSCACertVolumeName = "client-ca-cert"
 )
 
-// GetDragonflyResources returns the resources required for a Dragonfly
+// GenerateDragonflyResources returns the resources required for a Dragonfly
 // Instance
-func GetDragonflyResources(ctx context.Context, df *resourcesv1.Dragonfly) ([]client.Object, error) {
+func GenerateDragonflyResources(ctx context.Context, df *resourcesv1.Dragonfly) ([]client.Object, error) {
 	log := log.FromContext(ctx)
 	log.Info(fmt.Sprintf("Creating resources for %s", df.Name))
 

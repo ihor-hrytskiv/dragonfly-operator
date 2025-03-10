@@ -19,6 +19,9 @@ package controller
 import (
 	"context"
 	"fmt"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"time"
 
 	dfv1alpha1 "github.com/dragonflydb/dragonfly-operator/api/v1alpha1"
@@ -58,81 +61,17 @@ type DragonflyReconciler struct {
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.14.1/pkg/reconcile
 func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
-	var df dfv1alpha1.Dragonfly
-	if err := r.Get(ctx, req.NamespacedName, &df); err != nil {
-		log.Info(fmt.Sprintf("could not get the Dragonfly object: %s", req.NamespacedName))
+
+	df, err := r.getDragonfly(ctx, req.NamespacedName)
+	if err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	log.Info("Reconciling Dragonfly object")
-	// Ignore if resource is already created
-	if df.Status.Phase == "" {
-		log.Info("Creating resources")
-		resources, err := resources.GetDragonflyResources(ctx, &df)
-		if err != nil {
-			log.Error(err, "could not get resources")
-			return ctrl.Result{}, err
-		}
-
-		// create all resources
-		for _, resource := range resources {
-			if err := r.Create(ctx, resource); err != nil {
-				log.Error(err, fmt.Sprintf("could not create resource %s/%s/%s", resource.GetObjectKind(), resource.GetNamespace(), resource.GetName()))
-				return ctrl.Result{}, err
-			}
-		}
-
-		// Update Status
-		df.Status.Phase = PhaseResourcesCreated
-		log.Info("Created resources for object")
-		if err := r.Status().Update(ctx, &df); err != nil {
-			log.Error(err, "could not update the Dragonfly object")
-			return ctrl.Result{}, err
-		}
-
-		r.EventRecorder.Event(&df, corev1.EventTypeNormal, "Resources", "Created resources")
-		return ctrl.Result{}, nil
-	}
-
-	// Ensure all resources exist before moving forward.
-	missingResources, err := r.getMissingResources(ctx, &df)
-	if err != nil {
-		log.Error(err, "could not get resources")
+	log.Info("Reconciling Dragonfly object", "Phase", df.Status.Phase, "CreationTimestamp", df.CreationTimestamp, "dfSpec", df.Spec, "dfStatus", df.Status)
+	if err := r.ensureDragonflyResources(ctx, df); err != nil {
+		log.Error(err, "could not manage dragonfly resources")
 		return ctrl.Result{}, err
 	}
-	for _, resource := range missingResources {
-		// recreate missing resources
-		if err := r.Create(ctx, resource); err != nil {
-			log.Error(err, fmt.Sprintf("could not create resource %s/%s/%s", resource.GetObjectKind(), resource.GetNamespace(), resource.GetName()))
-			return ctrl.Result{}, err
-		}
-	}
-
-	var statefulSet appsv1.StatefulSet
-	if err := r.Get(ctx, client.ObjectKey{Namespace: df.Namespace, Name: df.Name}, &statefulSet); err != nil {
-		log.Error(err, "could not get statefulset")
-		return ctrl.Result{}, err
-	}
-
-	// Update all resources even if the df is in rollout state to ensure
-	// that newer updates don't get blocked by failed update attempts.
-	log.Info("updating existing resources")
-	newResources, err := resources.GetDragonflyResources(ctx, &df)
-	if err != nil {
-		log.Error(err, "could not get resources")
-		return ctrl.Result{}, err
-	}
-
-	// update all resources
-	for _, resource := range newResources {
-		if err := r.Update(ctx, resource); err != nil {
-			log.Error(err, fmt.Sprintf("could not update resource %s/%s/%s", resource.GetObjectKind(), resource.GetNamespace(), resource.GetName()))
-			return ctrl.Result{}, err
-		}
-	}
-
-	log.Info("Updated resources for object")
-	r.EventRecorder.Event(&df, corev1.EventTypeNormal, "Resources", "Updated resources")
 
 	if df.Status.IsRollingUpdate {
 		// This is a Rollout
@@ -227,7 +166,7 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			if !onLatestVersion {
 				// delete the replica
 				log.Info("deleting replica", "pod", replica.Name)
-				r.EventRecorder.Event(&df, corev1.EventTypeNormal, "Rollout", "Deleting replica")
+				r.EventRecorder.Event(df, corev1.EventTypeNormal, "Rollout", "Deleting replica")
 				if err := r.Delete(ctx, &replica); err != nil {
 					log.Error(err, "could not delete pod")
 					return ctrl.Result{RequeueAfter: 5 * time.Second}, err
@@ -264,7 +203,7 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 					return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 				}
 			}
-			r.EventRecorder.Event(&df, corev1.EventTypeNormal, "Rollout", fmt.Sprintf("Shutting down master %s", master.Name))
+			r.EventRecorder.Event(df, corev1.EventTypeNormal, "Rollout", fmt.Sprintf("Shutting down master %s", master.Name))
 
 			// delete the old master, so that it gets recreated with the new version
 			log.Info("deleting master", "pod", master.Name)
@@ -275,34 +214,143 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 
 		// If we are here all are on latest version
-		r.EventRecorder.Event(&df, corev1.EventTypeNormal, "Rollout", "Completed")
+		r.EventRecorder.Event(df, corev1.EventTypeNormal, "Rollout", "Completed")
 
 		// update status
 		df.Status.IsRollingUpdate = false
-		if err := r.Status().Update(ctx, &df); err != nil {
+		if err := r.Status().Update(ctx, df); err != nil {
 			log.Error(err, "could not update the Dragonfly object")
 			return ctrl.Result{Requeue: true}, err
 		}
 
 		return ctrl.Result{}, nil
-	} else if statefulSet.Status.UpdatedReplicas != statefulSet.Status.Replicas {
+	} else {
+		log.Info("Checking if pod spec has changed")
+		isRollingUpdate, err := r.isRollingUpdate(ctx, df)
+		if err != nil {
+			log.Error(err, "could not check if it is rolling update")
+			return ctrl.Result{Requeue: true}, nil
+		}
 		// perform a rollout only if the pod spec has changed
 		// Check if the pod spec has changed
-		log.Info("Checking if pod spec has changed", "updatedReplicas", statefulSet.Status.UpdatedReplicas, "currentReplicas", statefulSet.Status.Replicas)
-		log.Info("Pod spec has changed, performing a rollout")
-		r.EventRecorder.Event(&df, corev1.EventTypeNormal, "Rollout", "Starting a rollout")
+		if isRollingUpdate {
+			log.Info("Pod spec has changed, performing a rollout")
+			r.EventRecorder.Event(df, corev1.EventTypeNormal, "Rollout", "Starting a rollout")
 
-		// Start rollout and update status
-		// update status so that we can track progress
-		df.Status.IsRollingUpdate = true
-		if err := r.Status().Update(ctx, &df); err != nil {
-			log.Error(err, "could not update the Dragonfly object")
-			return ctrl.Result{Requeue: true}, err
+			// Start rollout and update status
+			// update status so that we can track progress
+			df.Status.IsRollingUpdate = true
+			if err := r.Status().Update(ctx, df); err != nil {
+				log.Error(err, "could not update the Dragonfly object")
+				return ctrl.Result{Requeue: true}, nil
+			}
+
+			r.EventRecorder.Event(df, corev1.EventTypeNormal, "Resources", "Performing a rollout")
 		}
 
-		r.EventRecorder.Event(&df, corev1.EventTypeNormal, "Resources", "Performing a rollout")
 	}
 	return ctrl.Result{Requeue: true}, nil
+}
+
+// ensureDragonflyResources makes sure the dragonfly resources exist and are up to date.
+func (r *DragonflyReconciler) ensureDragonflyResources(ctx context.Context, df *dfv1alpha1.Dragonfly) error {
+	dragonflyResources, err := resources.GenerateDragonflyResources(ctx, df)
+	if err != nil {
+		return fmt.Errorf("failed to generate dragonfly resources: %w", err)
+	}
+
+	for _, resource := range dragonflyResources {
+		resourceInfo := fmt.Sprintf("%s/%s/%s", getGVK(resource, r.Scheme).Kind, resource.GetNamespace(), resource.GetName())
+		existingResource := resource.DeepCopyObject().(client.Object)
+
+		if err = r.Get(ctx, client.ObjectKey{
+			Namespace: df.Namespace,
+			Name:      resource.GetName()},
+			existingResource,
+		); err != nil {
+			if errors.IsNotFound(err) {
+				if err = r.Create(ctx, resource); err != nil {
+					return fmt.Errorf("could not create %s: %w", resourceInfo, err)
+				}
+				continue
+			}
+			return fmt.Errorf("could not get %s: %w", resourceInfo, err)
+		}
+		if err = r.Update(ctx, resource); err != nil {
+			return fmt.Errorf("could not update %s: %w", resourceInfo, err)
+		}
+	}
+
+	if df.Status.Phase == "" {
+		df.Status.Phase = PhaseResourcesCreated
+		if err = r.Status().Update(ctx, df); err != nil {
+			return fmt.Errorf("could not update the Dragonfly object: %w", err)
+		}
+
+		r.EventRecorder.Event(df, corev1.EventTypeNormal, "Resources", "Created resources")
+	}
+
+	return nil
+}
+
+func getGVK(obj client.Object, scheme *runtime.Scheme) schema.GroupVersionKind {
+	gvk, err := apiutil.GVKForObject(obj, scheme)
+	if err != nil {
+		return schema.GroupVersionKind{Group: "Unknown", Version: "Unknown", Kind: "Unknown"}
+	}
+	return gvk
+}
+
+func (r *DragonflyReconciler) isRollingUpdate(ctx context.Context, df *dfv1alpha1.Dragonfly) (bool, error) {
+	sts, err := r.getStatefulSet(ctx, df)
+	if err != nil {
+		return false, err
+	}
+	pods, err := r.getPods(ctx, *sts)
+	if err != nil {
+		return false, err
+	}
+
+	if sts.Status.UpdatedReplicas != sts.Status.Replicas {
+		for _, pod := range pods.Items {
+			onLatestVersion, err := isPodOnLatestVersion(&pod, sts)
+			if err != nil {
+				return false, err
+			}
+			if !onLatestVersion {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func (r *DragonflyReconciler) getDragonfly(ctx context.Context, key client.ObjectKey) (*dfv1alpha1.Dragonfly, error) {
+	df := &dfv1alpha1.Dragonfly{}
+	if err := r.Get(ctx, key, df); err != nil {
+		return nil, fmt.Errorf("failed to get dragonfly %s/%s: %w", key.Namespace, key.Name, err)
+	}
+	return df, nil
+}
+
+func (r *DragonflyReconciler) getStatefulSet(ctx context.Context, df *dfv1alpha1.Dragonfly) (*appsv1.StatefulSet, error) {
+	sts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: df.Namespace, Name: df.Name}, sts); err != nil {
+		return nil, fmt.Errorf("failed to get statefulset %s/%s: %w", df.Namespace, df.Name, err)
+	}
+	return sts, nil
+}
+
+func (r *DragonflyReconciler) getPods(ctx context.Context, sts appsv1.StatefulSet) (*corev1.PodList, error) {
+	pods := &corev1.PodList{}
+	labelSelector := labels.Set(sts.Spec.Selector.MatchLabels)
+	if err := r.List(ctx, pods, &client.ListOptions{
+		Namespace:     sts.Namespace,
+		LabelSelector: labels.SelectorFromSet(labelSelector),
+	}); err != nil {
+		return nil, fmt.Errorf("failed to list pods: %w", err)
+	}
+	return pods, nil
 }
 
 func isFailedToStart(pod *corev1.Pod) bool {
@@ -321,29 +369,6 @@ func isFailureReason(reason string) bool {
 		reason == "ImagePullBackOff" ||
 		reason == "CrashLoopBackOff" ||
 		reason == "RunContainerError"
-}
-
-func (r *DragonflyReconciler) getMissingResources(ctx context.Context, df *dfv1alpha1.Dragonfly) ([]client.Object, error) {
-	resources, err := resources.GetDragonflyResources(ctx, df)
-	if err != nil {
-		return nil, err
-	}
-	missingResources := make([]client.Object, 0)
-	for _, resource := range resources {
-		obj := resource.DeepCopyObject().(client.Object)
-
-		err := r.Get(ctx, client.ObjectKey{
-			Namespace: df.Namespace,
-			Name:      resource.GetName(),
-		}, obj)
-
-		if errors.IsNotFound(err) {
-			missingResources = append(missingResources, resource)
-		} else if err != nil {
-			return nil, fmt.Errorf("failed to get resource %s/%s: %w", df.Namespace, resource.GetName(), err)
-		}
-	}
-	return missingResources, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
