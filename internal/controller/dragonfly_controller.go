@@ -20,8 +20,6 @@ import (
 	"context"
 	"fmt"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"time"
 
 	dfv1alpha1 "github.com/dragonflydb/dragonfly-operator/api/v1alpha1"
@@ -106,22 +104,16 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		// if not, requeue
 		fullSyncedUpdatedReplicas := 0
 		for _, replica := range replicas {
-			// Check only with latest replicas
-			onLatestVersion, err := isPodOnLatestVersion(replica, statefulSet)
-			if err != nil {
-				log.Error(err, "could not check if pod is on latest version")
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
-			}
-			if onLatestVersion {
-				// check if the replica had a full sync
-				log.Info("New Replica found. Checking if replica had a full sync", "pod", replica.Name)
-				isStableState, err := isStableState(ctx, replica)
+			if isPodOnLatestVersion(replica, statefulSet) {
+				// check if the replica is fully synced
+				log.Info("New Replica found. Checking if replica is fully synced", "pod", replica.Name)
+				isReplicaStable, err := isStableState(ctx, replica)
 				if err != nil {
 					log.Error(err, "could not check if pod is in stable state")
 					return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 				}
 
-				if !isStableState {
+				if !isReplicaStable {
 					log.Info("Not all new replicas are in stable status yet", "pod", replica.Name, "reason", err)
 					return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 				}
@@ -130,19 +122,12 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			}
 		}
 
-		log.Info(fmt.Sprintf("%d/%d replicas are in stable state", fullSyncedUpdatedReplicas, len(replicas)))
+		log.Info(fmt.Sprintf("%d/%d replicas are fully synced", fullSyncedUpdatedReplicas, len(replicas)))
 
 		// if we are here it means that all latest replicas are in stable sync
 		// delete older version replicas
 		for _, replica := range replicas {
-			// Check if pod is on latest version
-			onLatestVersion, err := isPodOnLatestVersion(replica, statefulSet)
-			if err != nil {
-				log.Error(err, "could not check if pod is on latest version")
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
-			}
-
-			if !onLatestVersion {
+			if !isPodOnLatestVersion(replica, statefulSet) {
 				// delete the replica
 				log.Info("deleting replica", "pod", replica.Name)
 				r.EventRecorder.Event(df, corev1.EventTypeNormal, "Rollout", "Deleting replica")
@@ -155,28 +140,18 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			}
 		}
 
-		var latestReplica *corev1.Pod
-		if len(replicas) > 0 {
-			latestReplica, err = getLatestReplica(ctx, r.Client, statefulSet)
-			if err != nil {
-				log.Error(err, "could not get latest replica")
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
-			}
-		}
-
-		masterOnLatest, err := isPodOnLatestVersion(master, statefulSet)
-		if err != nil {
-			log.Error(err, "could not check if pod is on latest version")
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, err
-		}
-
 		// If we are here it means that all replicas
 		// are on latest version
-		if !masterOnLatest {
+		if !isPodOnLatestVersion(master, statefulSet) {
 			// Update master now
-			if latestReplica != nil {
+			if len(replicas) > 0 {
+				replica, err := getStableReplica(ctx, replicas)
+				if err != nil {
+					log.Error(err, "could not get stable replica")
+					return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+				}
 				log.Info("Running REPLTAKEOVER on replica", "pod", master.Name)
-				if err := replTakeover(ctx, r.Client, latestReplica); err != nil {
+				if err := replTakeover(ctx, r.Client, replica); err != nil {
 					log.Error(err, "could not update master")
 					return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 				}
@@ -271,31 +246,6 @@ func (r *DragonflyReconciler) ensureDragonflyResources(ctx context.Context, df *
 	return nil
 }
 
-// getGVK returns the GroupVersionKind of the given object.
-func getGVK(obj client.Object, scheme *runtime.Scheme) schema.GroupVersionKind {
-	gvk, err := apiutil.GVKForObject(obj, scheme)
-	if err != nil {
-		return schema.GroupVersionKind{Group: "Unknown", Version: "Unknown", Kind: "Unknown"}
-	}
-	return gvk
-}
-
-// classifyPods classifies the given pods into master and replicas.
-func classifyPods(pods *corev1.PodList) (*corev1.Pod, []*corev1.Pod) {
-	master := &corev1.Pod{}
-	replicas := make([]*corev1.Pod, 0)
-	for _, pod := range pods.Items {
-		if _, ok := pod.Labels[resources.Role]; ok {
-			if pod.Labels[resources.Role] == resources.Replica {
-				replicas = append(replicas, &pod)
-			} else if pod.Labels[resources.Role] == resources.Master {
-				master = &pod
-			}
-		}
-	}
-	return master, replicas
-}
-
 // isRollingUpdate checks if the given Dragonfly object is in a rolling update state.
 func (r *DragonflyReconciler) isRollingUpdate(ctx context.Context, df *dfv1alpha1.Dragonfly) (bool, error) {
 	sts, err := r.getStatefulSet(ctx, df)
@@ -309,11 +259,7 @@ func (r *DragonflyReconciler) isRollingUpdate(ctx context.Context, df *dfv1alpha
 
 	if sts.Status.UpdatedReplicas != sts.Status.Replicas {
 		for _, pod := range pods.Items {
-			onLatestVersion, err := isPodOnLatestVersion(&pod, sts)
-			if err != nil {
-				return false, err
-			}
-			if !onLatestVersion {
+			if !isPodOnLatestVersion(&pod, sts) {
 				return true, nil
 			}
 		}
@@ -321,6 +267,7 @@ func (r *DragonflyReconciler) isRollingUpdate(ctx context.Context, df *dfv1alpha
 	return false, nil
 }
 
+// getDragonfly returns the Dragonfly object with the given NamespacedName
 func (r *DragonflyReconciler) getDragonfly(ctx context.Context, key client.ObjectKey) (*dfv1alpha1.Dragonfly, error) {
 	df := &dfv1alpha1.Dragonfly{}
 	if err := r.Get(ctx, key, df); err != nil {
@@ -329,6 +276,7 @@ func (r *DragonflyReconciler) getDragonfly(ctx context.Context, key client.Objec
 	return df, nil
 }
 
+// getStatefulSet returns the StatefulSet of the given Dragonfly object.
 func (r *DragonflyReconciler) getStatefulSet(ctx context.Context, df *dfv1alpha1.Dragonfly) (*appsv1.StatefulSet, error) {
 	sts := &appsv1.StatefulSet{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: df.Namespace, Name: df.Name}, sts); err != nil {
@@ -337,6 +285,7 @@ func (r *DragonflyReconciler) getStatefulSet(ctx context.Context, df *dfv1alpha1
 	return sts, nil
 }
 
+// getPods returns the pods of the given StatefulSet.
 func (r *DragonflyReconciler) getPods(ctx context.Context, sts *appsv1.StatefulSet) (*corev1.PodList, error) {
 	pods := &corev1.PodList{}
 	labelSelector := labels.Set(sts.Spec.Selector.MatchLabels)
@@ -347,24 +296,6 @@ func (r *DragonflyReconciler) getPods(ctx context.Context, sts *appsv1.StatefulS
 		return nil, fmt.Errorf("failed to list pods: %w", err)
 	}
 	return pods, nil
-}
-
-func isFailedToStart(pod *corev1.Pod) bool {
-	for _, containerStatus := range pod.Status.ContainerStatuses {
-		if (containerStatus.State.Waiting != nil && isFailureReason(containerStatus.State.Waiting.Reason)) ||
-			(containerStatus.State.Terminated != nil && isFailureReason(containerStatus.State.Terminated.Reason)) {
-			return true
-		}
-	}
-	return false
-}
-
-// isFailureReason checks if the given reason indicates a failure.
-func isFailureReason(reason string) bool {
-	return reason == "ErrImagePull" ||
-		reason == "ImagePullBackOff" ||
-		reason == "CrashLoopBackOff" ||
-		reason == "RunContainerError"
 }
 
 // SetupWithManager sets up the controller with the Manager.
