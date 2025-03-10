@@ -20,14 +20,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
-
 	"github.com/dragonflydb/dragonfly-operator/internal/resources"
 	"github.com/redis/go-redis/v9"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	"strings"
 )
 
 const (
@@ -38,19 +40,18 @@ const (
 
 // isPodOnLatestVersion returns if the Given pod is on the updatedRevision
 // of the given statefulset or not
-func isPodOnLatestVersion(pod *corev1.Pod, statefulSet *appsv1.StatefulSet) (bool, error) {
+func isPodOnLatestVersion(pod *corev1.Pod, statefulSet *appsv1.StatefulSet) bool {
 	// Get the pod's revision
 	podRevision, ok := pod.Labels[appsv1.StatefulSetRevisionLabel]
 	if !ok {
-		return false, fmt.Errorf("pod %s/%s does not have a revision label", pod.Namespace, pod.Name)
+		return false
 	}
 
-	// Compare the two
 	if podRevision == statefulSet.Status.UpdateRevision {
-		return true, nil
+		return true
 	}
 
-	return false, nil
+	return false
 }
 
 // getLatestReplica returns a replica pod which is on the latest version
@@ -71,19 +72,27 @@ func getLatestReplica(ctx context.Context, c client.Client, statefulSet *appsv1.
 
 	// Iterate over the pods and find a replica which is on the latest version
 	for _, pod := range podList.Items {
-
-		isLatest, err := isPodOnLatestVersion(&pod, statefulSet)
-		if err != nil {
-			return nil, err
-		}
-
-		if isLatest && pod.Labels[resources.Role] == resources.Replica {
+		if isPodOnLatestVersion(&pod, statefulSet) && pod.Labels[resources.Role] == resources.Replica {
 			return &pod, nil
 		}
 	}
 
 	return nil, errors.New("no replica pod found on latest version")
 
+}
+
+// getStableReplica returns first stable replica pod from the given list of replica
+func getStableReplica(ctx context.Context, replicas []*corev1.Pod) (*corev1.Pod, error) {
+	for _, replica := range replicas {
+		isReplicaStable, err := isStableState(ctx, replica)
+		if err != nil {
+			return nil, fmt.Errorf("could not check if pod is in stable state: %w", err)
+		}
+		if isReplicaStable {
+			return replica, nil
+		}
+	}
+	return nil, errors.New("no stable replica pod found")
 }
 
 // replTakeover runs the replTakeOver on the given replica pod
@@ -110,9 +119,10 @@ func replTakeover(ctx context.Context, c client.Client, newMaster *corev1.Pod) e
 	return nil
 }
 
+// isStableState checks if the given pod is in a stable state or not
 func isStableState(ctx context.Context, pod *corev1.Pod) (bool, error) {
 	// wait until pod IP is ready
-	if pod.Status.PodIP == "" || pod.Status.Phase != corev1.PodRunning {
+	if pod.Status.PodIP == "" || !podReady(pod) {
 		return false, nil
 	}
 
@@ -157,4 +167,41 @@ func isStableState(ctx context.Context, pod *corev1.Pod) (bool, error) {
 	}
 
 	return true, nil
+}
+
+// PodReady returns true if the pod is marked as ready (as determined by the pod's
+// Status.Conditions)
+func podReady(pod *corev1.Pod) bool {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+
+	return false
+}
+
+// getGVK returns the GroupVersionKind of the given object.
+func getGVK(obj client.Object, scheme *runtime.Scheme) schema.GroupVersionKind {
+	gvk, err := apiutil.GVKForObject(obj, scheme)
+	if err != nil {
+		return schema.GroupVersionKind{Group: "Unknown", Version: "Unknown", Kind: "Unknown"}
+	}
+	return gvk
+}
+
+// classifyPods classifies the given pods into master and replicas.
+func classifyPods(pods *corev1.PodList) (*corev1.Pod, []*corev1.Pod) {
+	master := &corev1.Pod{}
+	replicas := make([]*corev1.Pod, 0)
+	for _, pod := range pods.Items {
+		if _, ok := pod.Labels[resources.Role]; ok {
+			if pod.Labels[resources.Role] == resources.Replica {
+				replicas = append(replicas, &pod)
+			} else if pod.Labels[resources.Role] == resources.Master {
+				master = &pod
+			}
+		}
+	}
+	return master, replicas
 }
