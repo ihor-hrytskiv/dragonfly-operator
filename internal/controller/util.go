@@ -20,6 +20,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"strings"
 
 	"github.com/dragonflydb/dragonfly-operator/internal/resources"
@@ -157,4 +160,29 @@ func isStableState(ctx context.Context, pod *corev1.Pod) (bool, error) {
 	}
 
 	return true, nil
+}
+
+// getGVK returns the GroupVersionKind of the given object.
+func getGVK(obj client.Object, scheme *runtime.Scheme) schema.GroupVersionKind {
+	gvk, err := apiutil.GVKForObject(obj, scheme)
+	if err != nil {
+		return schema.GroupVersionKind{Group: "Unknown", Version: "Unknown", Kind: "Unknown"}
+	}
+	return gvk
+}
+
+// classifyPods classifies the given pods into master and replicas.
+func classifyPods(pods *corev1.PodList) (*corev1.Pod, []*corev1.Pod) {
+	master := &corev1.Pod{}
+	replicas := make([]*corev1.Pod, 0)
+	for _, pod := range pods.Items {
+		if _, ok := pod.Labels[resources.Role]; ok {
+			if pod.Labels[resources.Role] == resources.Replica {
+				replicas = append(replicas, &pod)
+			} else if pod.Labels[resources.Role] == resources.Master {
+				master = &pod
+			}
+		}
+	}
+	return master, replicas
 }

@@ -20,13 +20,9 @@ import (
 	"context"
 	"fmt"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"time"
 
 	dfv1alpha1 "github.com/dragonflydb/dragonfly-operator/api/v1alpha1"
-	"github.com/dragonflydb/dragonfly-operator/internal/resources"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -84,8 +80,7 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			return ctrl.Result{Requeue: true}, err
 		}
 
-		// get pods of the statefulset
-		pods, err := r.getPods(ctx, statefulSet)
+		pods, err := dfi.getPods(ctx)
 		if err != nil {
 			log.Error(err, "could not list pods")
 			return ctrl.Result{Requeue: true}, err
@@ -96,7 +91,7 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			return ctrl.Result{Requeue: true}, nil
 		}
 
-		// filter replicas to master and replicas
+		// filter pods to master and replicas
 		master, replicas := classifyPods(pods)
 		if err != nil {
 			log.Error(err, "could not get master and replicas")
@@ -230,69 +225,6 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	}
 	return ctrl.Result{Requeue: true}, nil
-}
-
-// getGVK returns the GroupVersionKind of the given object.
-func getGVK(obj client.Object, scheme *runtime.Scheme) schema.GroupVersionKind {
-	gvk, err := apiutil.GVKForObject(obj, scheme)
-	if err != nil {
-		return schema.GroupVersionKind{Group: "Unknown", Version: "Unknown", Kind: "Unknown"}
-	}
-	return gvk
-}
-
-// classifyPods classifies the given pods into master and replicas.
-func classifyPods(pods *corev1.PodList) (*corev1.Pod, []*corev1.Pod) {
-	master := &corev1.Pod{}
-	replicas := make([]*corev1.Pod, 0)
-	for _, pod := range pods.Items {
-		if _, ok := pod.Labels[resources.Role]; ok {
-			if pod.Labels[resources.Role] == resources.Replica {
-				replicas = append(replicas, &pod)
-			} else if pod.Labels[resources.Role] == resources.Master {
-				master = &pod
-			}
-		}
-	}
-	return master, replicas
-}
-
-func (r *DragonflyReconciler) getDragonfly(ctx context.Context, key client.ObjectKey) (*dfv1alpha1.Dragonfly, error) {
-	df := &dfv1alpha1.Dragonfly{}
-	if err := r.Get(ctx, key, df); err != nil {
-		return nil, fmt.Errorf("failed to get dragonfly %s/%s: %w", key.Namespace, key.Name, err)
-	}
-	return df, nil
-}
-
-func (r *DragonflyReconciler) getPods(ctx context.Context, sts *appsv1.StatefulSet) (*corev1.PodList, error) {
-	pods := &corev1.PodList{}
-	labelSelector := labels.Set(sts.Spec.Selector.MatchLabels)
-	if err := r.List(ctx, pods, &client.ListOptions{
-		Namespace:     sts.Namespace,
-		LabelSelector: labels.SelectorFromSet(labelSelector),
-	}); err != nil {
-		return nil, fmt.Errorf("failed to list pods: %w", err)
-	}
-	return pods, nil
-}
-
-func isFailedToStart(pod *corev1.Pod) bool {
-	for _, containerStatus := range pod.Status.ContainerStatuses {
-		if (containerStatus.State.Waiting != nil && isFailureReason(containerStatus.State.Waiting.Reason)) ||
-			(containerStatus.State.Terminated != nil && isFailureReason(containerStatus.State.Terminated.Reason)) {
-			return true
-		}
-	}
-	return false
-}
-
-// isFailureReason checks if the given reason indicates a failure.
-func isFailureReason(reason string) bool {
-	return reason == "ErrImagePull" ||
-		reason == "ImagePullBackOff" ||
-		reason == "CrashLoopBackOff" ||
-		reason == "RunContainerError"
 }
 
 func (r *DragonflyReconciler) GetClient() client.Client { return r.Client }
