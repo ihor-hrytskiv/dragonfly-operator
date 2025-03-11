@@ -28,7 +28,6 @@ import (
 	"github.com/dragonflydb/dragonfly-operator/internal/resources"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -68,7 +67,7 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	log.Info("Reconciling Dragonfly object")
-	if err := r.ensureDragonflyResources(ctx, dfi.df); err != nil {
+	if err := dfi.ensureDragonflyResources(ctx); err != nil {
 		log.Error(err, "could not manage dragonfly resources")
 		return ctrl.Result{}, err
 	}
@@ -228,47 +227,6 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	}
 	return ctrl.Result{Requeue: true}, nil
-}
-
-// ensureDragonflyResources makes sure the dragonfly resources exist and are up to date.
-func (r *DragonflyReconciler) ensureDragonflyResources(ctx context.Context, df *dfv1alpha1.Dragonfly) error {
-	dragonflyResources, err := resources.GenerateDragonflyResources(ctx, df)
-	if err != nil {
-		return fmt.Errorf("failed to generate dragonfly resources: %w", err)
-	}
-
-	for _, resource := range dragonflyResources {
-		resourceInfo := fmt.Sprintf("%s/%s/%s", getGVK(resource, r.Scheme).Kind, resource.GetNamespace(), resource.GetName())
-		existingResource := resource.DeepCopyObject().(client.Object)
-
-		if err = r.Get(ctx, client.ObjectKey{
-			Namespace: df.Namespace,
-			Name:      resource.GetName()},
-			existingResource,
-		); err != nil {
-			if errors.IsNotFound(err) {
-				if err = r.Create(ctx, resource); err != nil {
-					return fmt.Errorf("could not create %s: %w", resourceInfo, err)
-				}
-				continue
-			}
-			return fmt.Errorf("could not get %s: %w", resourceInfo, err)
-		}
-		if err = r.Update(ctx, resource); err != nil {
-			return fmt.Errorf("could not update %s: %w", resourceInfo, err)
-		}
-	}
-
-	if df.Status.Phase == "" {
-		df.Status.Phase = PhaseResourcesCreated
-		if err = r.Status().Update(ctx, df); err != nil {
-			return fmt.Errorf("could not update the Dragonfly object: %w", err)
-		}
-
-		r.EventRecorder.Event(df, corev1.EventTypeNormal, "Resources", "Created resources")
-	}
-
-	return nil
 }
 
 // getGVK returns the GroupVersionKind of the given object.

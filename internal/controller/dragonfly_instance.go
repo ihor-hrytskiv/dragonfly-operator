@@ -31,6 +31,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/redis/go-redis/v9"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -383,6 +384,49 @@ func (dfi *DragonflyInstance) replicaOfNoOne(ctx context.Context, pod *corev1.Po
 	pod.Labels[resources.Role] = resources.Master
 	if err := dfi.client.Update(ctx, pod); err != nil {
 		return err
+	}
+
+	return nil
+}
+
+// ensureDragonflyResources makes sure the dragonfly resources exist and are up to date.
+func (dfi *DragonflyInstance) ensureDragonflyResources(ctx context.Context) error {
+	dragonflyResources, err := resources.GenerateDragonflyResources(ctx, dfi.df)
+	if err != nil {
+		return fmt.Errorf("failed to generate dragonfly resources: %w", err)
+	}
+
+	for _, resource := range dragonflyResources {
+		resourceInfo := fmt.Sprintf("%s/%s/%s", getGVK(resource, dfi.scheme).Kind, resource.GetNamespace(), resource.GetName())
+		existingResource := resource.DeepCopyObject().(client.Object)
+
+		if err = dfi.client.Get(ctx, client.ObjectKey{
+			Namespace: dfi.df.Namespace,
+			Name:      resource.GetName()},
+			existingResource,
+		); err != nil {
+			if apierrors.IsNotFound(err) {
+				dfi.log.Info(fmt.Sprintf("Creating resource: %s", resourceInfo))
+				if err = dfi.client.Create(ctx, resource); err != nil {
+					return fmt.Errorf("could not create %s: %w", resourceInfo, err)
+				}
+				continue
+			}
+			return fmt.Errorf("could not get %s: %w", resourceInfo, err)
+		}
+		if err = dfi.client.Update(ctx, resource); err != nil {
+			dfi.log.Info(fmt.Sprintf("Updating resource: %s", resourceInfo))
+			return fmt.Errorf("could not update %s: %w", resourceInfo, err)
+		}
+	}
+
+	if dfi.df.Status.Phase == "" {
+		dfi.df.Status.Phase = PhaseResourcesCreated
+		if err = dfi.client.Status().Update(ctx, dfi.df); err != nil {
+			return fmt.Errorf("could not update the Dragonfly object: %w", err)
+		}
+
+		dfi.eventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Resources", "Created resources")
 	}
 
 	return nil
