@@ -322,6 +322,7 @@ func (dfi *DragonflyInstance) checkAndConfigureReplication(ctx context.Context) 
 	return nil
 }
 
+// getStatefulSet gets the statefulset object for the dragonfly instance
 func (dfi *DragonflyInstance) getStatefulSet(ctx context.Context) (*appsv1.StatefulSet, error) {
 	var sts appsv1.StatefulSet
 	if err := dfi.client.Get(ctx, client.ObjectKey{Namespace: dfi.df.Namespace, Name: dfi.df.Name}, &sts); err != nil {
@@ -470,6 +471,7 @@ func (dfi *DragonflyInstance) isRollingUpdate(ctx context.Context) (bool, error)
 	return false, nil
 }
 
+// checkUpdatedReplicas checks if the updated replicas are in a stable state
 func (dfi *DragonflyInstance) checkUpdatedReplicas(ctx context.Context, sts *appsv1.StatefulSet, replicas []*corev1.Pod) (ctrl.Result, error) {
 	fullSyncedUpdatedReplicas := 0
 	for _, replica := range replicas {
@@ -495,6 +497,7 @@ func (dfi *DragonflyInstance) checkUpdatedReplicas(ctx context.Context, sts *app
 	return ctrl.Result{}, nil
 }
 
+// deleteOldReplicas deletes the old replicas
 func (dfi *DragonflyInstance) deleteOldReplicas(ctx context.Context, sts *appsv1.StatefulSet, replicas []*corev1.Pod) (ctrl.Result, error) {
 	for _, replica := range replicas {
 		if !isPodOnLatestVersion(replica, sts) {
@@ -529,5 +532,4 @@ func (dfi *DragonflyInstance) getLatestReplica(ctx context.Context, sts *appsv1.
 	}
 
 	return nil, errors.New("no replica pod found on latest version")
-
 }
