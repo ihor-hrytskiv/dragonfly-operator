@@ -119,15 +119,9 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			}
 		}
 
-		masterOnLatest, err := isPodOnLatestVersion(master, statefulSet)
-		if err != nil {
-			log.Error(err, "could not check if pod is on latest version")
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, err
-		}
-
 		// If we are here it means that all replicas
 		// are on latest version
-		if !masterOnLatest {
+		if !isPodOnLatestVersion(master, statefulSet) {
 			// Update master now
 			if latestReplica != nil {
 				log.Info("Running REPLTAKEOVER on replica", "pod", master.Name)

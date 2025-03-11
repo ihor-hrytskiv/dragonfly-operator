@@ -41,30 +41,23 @@ const (
 
 // isPodOnLatestVersion returns if the Given pod is on the updatedRevision
 // of the given statefulset or not
-func isPodOnLatestVersion(pod *corev1.Pod, statefulSet *appsv1.StatefulSet) (bool, error) {
-	// Get the pod's revision
-	podRevision, ok := pod.Labels[appsv1.StatefulSetRevisionLabel]
-	if !ok {
-		return false, fmt.Errorf("pod %s/%s does not have a revision label", pod.Namespace, pod.Name)
+func isPodOnLatestVersion(pod *corev1.Pod, sts *appsv1.StatefulSet) bool {
+	if pod.Labels[appsv1.StatefulSetRevisionLabel] == sts.Status.UpdateRevision {
+		return true
 	}
 
-	// Compare the two
-	if podRevision == statefulSet.Status.UpdateRevision {
-		return true, nil
-	}
-
-	return false, nil
+	return false
 }
 
 // getLatestReplica returns a replica pod which is on the latest version
 // of the given statefulset
-func getLatestReplica(ctx context.Context, c client.Client, statefulSet *appsv1.StatefulSet) (*corev1.Pod, error) {
+func getLatestReplica(ctx context.Context, c client.Client, sts *appsv1.StatefulSet) (*corev1.Pod, error) {
 	// Get the list of pods
 	podList := &corev1.PodList{}
 	err := c.List(ctx, podList, &client.ListOptions{
-		Namespace: statefulSet.Namespace,
+		Namespace: sts.Namespace,
 		LabelSelector: labels.SelectorFromValidatedSet(map[string]string{
-			"app":                              statefulSet.Name,
+			"app":                              sts.Name,
 			resources.KubernetesPartOfLabelKey: "dragonfly",
 		}),
 	})
@@ -74,13 +67,7 @@ func getLatestReplica(ctx context.Context, c client.Client, statefulSet *appsv1.
 
 	// Iterate over the pods and find a replica which is on the latest version
 	for _, pod := range podList.Items {
-
-		isLatest, err := isPodOnLatestVersion(&pod, statefulSet)
-		if err != nil {
-			return nil, err
-		}
-
-		if isLatest && pod.Labels[resources.Role] == resources.Replica {
+		if isPodOnLatestVersion(&pod, sts) && pod.Labels[resources.Role] == resources.Replica {
 			return &pod, nil
 		}
 	}

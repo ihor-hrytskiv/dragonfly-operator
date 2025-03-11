@@ -462,11 +462,7 @@ func (dfi *DragonflyInstance) isRollingUpdate(ctx context.Context) (bool, error)
 
 	if sts.Status.UpdatedReplicas != sts.Status.Replicas {
 		for _, pod := range pods.Items {
-			onLatestVersion, err := isPodOnLatestVersion(&pod, sts)
-			if err != nil {
-				return false, err
-			}
-			if !onLatestVersion {
+			if !isPodOnLatestVersion(&pod, sts) {
 				return true, nil
 			}
 		}
@@ -477,12 +473,7 @@ func (dfi *DragonflyInstance) isRollingUpdate(ctx context.Context) (bool, error)
 func (dfi *DragonflyInstance) checkUpdatedReplicas(ctx context.Context, sts *appsv1.StatefulSet, replicas []*corev1.Pod) (ctrl.Result, error) {
 	fullSyncedUpdatedReplicas := 0
 	for _, replica := range replicas {
-		onLatestVersion, err := isPodOnLatestVersion(replica, sts)
-		if err != nil {
-			dfi.log.Error(err, "could not check if pod is on latest version")
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, err
-		}
-		if onLatestVersion {
+		if isPodOnLatestVersion(replica, sts) {
 			dfi.log.Info("New Replica found. Checking if replica had a full sync", "pod", replica.Name)
 			isStableState, err := isStableState(ctx, replica)
 			if err != nil {
@@ -506,13 +497,7 @@ func (dfi *DragonflyInstance) checkUpdatedReplicas(ctx context.Context, sts *app
 
 func (dfi *DragonflyInstance) deleteOldReplicas(ctx context.Context, sts *appsv1.StatefulSet, replicas []*corev1.Pod) (ctrl.Result, error) {
 	for _, replica := range replicas {
-		onLatestVersion, err := isPodOnLatestVersion(replica, sts)
-		if err != nil {
-			dfi.log.Error(err, "could not check if pod is on latest version")
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, err
-		}
-
-		if !onLatestVersion {
+		if !isPodOnLatestVersion(replica, sts) {
 			// delete the replica
 			dfi.log.Info("deleting replica", "pod", replica.Name)
 			dfi.eventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Rollout", "Deleting replica")
