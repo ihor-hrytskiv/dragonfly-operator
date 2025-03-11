@@ -512,3 +512,22 @@ func (dfi *DragonflyInstance) deleteOldReplicas(ctx context.Context, sts *appsv1
 
 	return ctrl.Result{}, nil
 }
+
+// getLatestReplica returns a replica pod which is on the latest version
+// of the given statefulset
+func (dfi *DragonflyInstance) getLatestReplica(ctx context.Context, sts *appsv1.StatefulSet) (*corev1.Pod, error) {
+	pods, err := dfi.getPods(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Iterate over the pods and find a replica which is on the latest version
+	for _, pod := range pods.Items {
+		if isPodOnLatestVersion(&pod, sts) && isReplica(&pod) {
+			return &pod, nil
+		}
+	}
+
+	return nil, errors.New("no replica pod found on latest version")
+
+}

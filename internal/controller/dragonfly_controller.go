@@ -112,7 +112,7 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 		var latestReplica *corev1.Pod
 		if len(replicas) > 0 {
-			latestReplica, err = getLatestReplica(ctx, r.Client, statefulSet)
+			latestReplica, err = dfi.getLatestReplica(ctx, statefulSet)
 			if err != nil {
 				log.Error(err, "could not get latest replica")
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, err

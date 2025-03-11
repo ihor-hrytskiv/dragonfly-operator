@@ -29,7 +29,6 @@ import (
 	"github.com/redis/go-redis/v9"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -42,38 +41,11 @@ const (
 // isPodOnLatestVersion returns if the Given pod is on the updatedRevision
 // of the given statefulset or not
 func isPodOnLatestVersion(pod *corev1.Pod, sts *appsv1.StatefulSet) bool {
-	if pod.Labels[appsv1.StatefulSetRevisionLabel] == sts.Status.UpdateRevision {
+	if podRevision, ok := pod.Labels[appsv1.StatefulSetRevisionLabel]; ok && podRevision == sts.Status.UpdateRevision {
 		return true
 	}
 
 	return false
-}
-
-// getLatestReplica returns a replica pod which is on the latest version
-// of the given statefulset
-func getLatestReplica(ctx context.Context, c client.Client, sts *appsv1.StatefulSet) (*corev1.Pod, error) {
-	// Get the list of pods
-	podList := &corev1.PodList{}
-	err := c.List(ctx, podList, &client.ListOptions{
-		Namespace: sts.Namespace,
-		LabelSelector: labels.SelectorFromValidatedSet(map[string]string{
-			"app":                              sts.Name,
-			resources.KubernetesPartOfLabelKey: "dragonfly",
-		}),
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	// Iterate over the pods and find a replica which is on the latest version
-	for _, pod := range podList.Items {
-		if isPodOnLatestVersion(&pod, sts) && pod.Labels[resources.Role] == resources.Replica {
-			return &pod, nil
-		}
-	}
-
-	return nil, errors.New("no replica pod found on latest version")
-
 }
 
 // replTakeover runs the replTakeOver on the given replica pod
@@ -164,12 +136,26 @@ func classifyPods(pods *corev1.PodList) (*corev1.Pod, []*corev1.Pod) {
 	replicas := make([]*corev1.Pod, 0)
 	for _, pod := range pods.Items {
 		if _, ok := pod.Labels[resources.Role]; ok {
-			if pod.Labels[resources.Role] == resources.Replica {
+			if isReplica(&pod) {
 				replicas = append(replicas, &pod)
-			} else if pod.Labels[resources.Role] == resources.Master {
+			} else if isMaster(&pod) {
 				master = &pod
 			}
 		}
 	}
 	return master, replicas
+}
+
+func isMaster(pod *corev1.Pod) bool {
+	if role, ok := pod.Labels[resources.Role]; ok && role == resources.Master {
+		return true
+	}
+	return false
+}
+
+func isReplica(pod *corev1.Pod) bool {
+	if role, ok := pod.Labels[resources.Role]; ok && role == resources.Replica {
+		return true
+	}
+	return false
 }
