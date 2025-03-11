@@ -66,9 +66,8 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	log.Info("Reconciling Dragonfly object")
-	if err := dfi.ensureDragonflyResources(ctx); err != nil {
-		log.Error(err, "could not manage dragonfly resources")
-		return ctrl.Result{}, err
+	if result, err := dfi.ensureDragonflyResources(ctx); !result.IsZero() || err != nil {
+		return result, err
 	}
 
 	if dfi.df.Status.IsRollingUpdate {
@@ -95,61 +94,20 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		master, replicas := classifyPods(pods)
 		if err != nil {
 			log.Error(err, "could not get master and replicas")
-			return ctrl.Result{Requeue: true}, err
+			return ctrl.Result{Requeue: true}, nil
 		}
 
 		// We want to update the replicas first then the master
 		// We want to have at most one updated replica in full sync phase at a time
 		// if not, requeue
-		fullSyncedUpdatedReplicas := 0
-		for _, replica := range replicas {
-			// Check only with latest replicas
-			onLatestVersion, err := isPodOnLatestVersion(replica, statefulSet)
-			if err != nil {
-				log.Error(err, "could not check if pod is on latest version")
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
-			}
-			if onLatestVersion {
-				// check if the replica had a full sync
-				log.Info("New Replica found. Checking if replica had a full sync", "pod", replica.Name)
-				isStableState, err := isStableState(ctx, replica)
-				if err != nil {
-					log.Error(err, "could not check if pod is in stable state")
-					return ctrl.Result{RequeueAfter: 5 * time.Second}, err
-				}
-
-				if !isStableState {
-					log.Info("Not all new replicas are in stable status yet", "pod", replica.Name, "reason", err)
-					return ctrl.Result{RequeueAfter: 5 * time.Second}, err
-				}
-				log.Info("Replica is in stable state", "pod", replica.Name)
-				fullSyncedUpdatedReplicas++
-			}
+		if result, err := dfi.checkUpdatedReplicas(ctx, statefulSet, replicas); !result.IsZero() || err != nil {
+			return result, err
 		}
-
-		log.Info(fmt.Sprintf("%d/%d replicas are in stable state", fullSyncedUpdatedReplicas, len(replicas)))
 
 		// if we are here it means that all latest replicas are in stable sync
 		// delete older version replicas
-		for _, replica := range replicas {
-			// Check if pod is on latest version
-			onLatestVersion, err := isPodOnLatestVersion(replica, statefulSet)
-			if err != nil {
-				log.Error(err, "could not check if pod is on latest version")
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
-			}
-
-			if !onLatestVersion {
-				// delete the replica
-				log.Info("deleting replica", "pod", replica.Name)
-				r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Rollout", "Deleting replica")
-				if err := r.Delete(ctx, replica); err != nil {
-					log.Error(err, "could not delete pod")
-					return ctrl.Result{RequeueAfter: 5 * time.Second}, err
-				}
-
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-			}
+		if result, err := dfi.deleteOldReplicas(ctx, statefulSet, replicas); !result.IsZero() || err != nil {
+			return result, err
 		}
 
 		var latestReplica *corev1.Pod
