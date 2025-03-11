@@ -125,7 +125,7 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			// Update master now
 			if latestReplica != nil {
 				log.Info("Running REPLTAKEOVER on replica", "pod", master.Name)
-				if err := replTakeover(ctx, r.Client, latestReplica); err != nil {
+				if err := dfi.replTakeover(ctx, latestReplica); err != nil {
 					log.Error(err, "could not update master")
 					return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 				}

@@ -533,3 +533,27 @@ func (dfi *DragonflyInstance) getLatestReplica(ctx context.Context, sts *appsv1.
 
 	return nil, errors.New("no replica pod found on latest version")
 }
+
+// replTakeover runs the replTakeOver on the given replica pod
+func (dfi *DragonflyInstance) replTakeover(ctx context.Context, newMaster *corev1.Pod) error {
+	redisClient := redis.NewClient(&redis.Options{
+		Addr: fmt.Sprintf("%s:%d", newMaster.Status.PodIP, resources.DragonflyAdminPort),
+	})
+	defer redisClient.Close()
+
+	resp, err := redisClient.Do(ctx, "repltakeover", "10000").Result()
+	if err != nil {
+		return fmt.Errorf("error running REPLTAKEOVER command: %w", err)
+	}
+
+	if resp != "OK" {
+		return fmt.Errorf("response of `REPLTAKEOVER` on replica is not OK: %s", resp)
+	}
+
+	// update the label on the pod
+	newMaster.Labels[resources.Role] = resources.Master
+	if err := dfi.client.Update(ctx, newMaster); err != nil {
+		return fmt.Errorf("error updating the role label on the pod: %w", err)
+	}
+	return nil
+}
