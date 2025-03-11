@@ -391,6 +391,7 @@ func (dfi *DragonflyInstance) replicaOfNoOne(ctx context.Context, pod *corev1.Po
 
 // ensureDragonflyResources makes sure the dragonfly resources exist and are up to date.
 func (dfi *DragonflyInstance) ensureDragonflyResources(ctx context.Context) error {
+	dfi.log.Info("Ensuring dragonfly resources")
 	dragonflyResources, err := resources.GenerateDragonflyResources(ctx, dfi.df)
 	if err != nil {
 		return fmt.Errorf("failed to generate dragonfly resources: %w", err)
@@ -414,8 +415,9 @@ func (dfi *DragonflyInstance) ensureDragonflyResources(ctx context.Context) erro
 			}
 			return fmt.Errorf("could not get %s: %w", resourceInfo, err)
 		}
+
+		dfi.log.Info(fmt.Sprintf("Updating resource: %s", resourceInfo))
 		if err = dfi.client.Update(ctx, resource); err != nil {
-			dfi.log.Info(fmt.Sprintf("Updating resource: %s", resourceInfo))
 			return fmt.Errorf("could not update %s: %w", resourceInfo, err)
 		}
 	}
