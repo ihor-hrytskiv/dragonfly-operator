@@ -61,21 +61,22 @@ type DragonflyReconciler struct {
 func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
-	df, err := r.getDragonfly(ctx, req.NamespacedName)
+	dfi, err := getDragonflyInstance(ctx, req.NamespacedName, r, log)
 	if err != nil {
+		log.Info("could not get Dragonfly instance")
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	log.Info("Reconciling Dragonfly object", "Phase", df.Status.Phase, "CreationTimestamp", df.CreationTimestamp, "dfSpec", df.Spec, "dfStatus", df.Status)
-	if err := r.ensureDragonflyResources(ctx, df); err != nil {
+	log.Info("Reconciling Dragonfly object")
+	if err := r.ensureDragonflyResources(ctx, dfi.df); err != nil {
 		log.Error(err, "could not manage dragonfly resources")
 		return ctrl.Result{}, err
 	}
 
-	if df.Status.IsRollingUpdate {
+	if dfi.df.Status.IsRollingUpdate {
 		// This is a Rollout
 		log.Info("Rolling out new version")
-		statefulSet, err := r.getStatefulSet(ctx, df)
+		statefulSet, err := r.getStatefulSet(ctx, dfi.df)
 		if err != nil {
 			log.Error(err, "could not get statefulset")
 			return ctrl.Result{Requeue: true}, err
@@ -144,7 +145,7 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			if !onLatestVersion {
 				// delete the replica
 				log.Info("deleting replica", "pod", replica.Name)
-				r.EventRecorder.Event(df, corev1.EventTypeNormal, "Rollout", "Deleting replica")
+				r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Rollout", "Deleting replica")
 				if err := r.Delete(ctx, replica); err != nil {
 					log.Error(err, "could not delete pod")
 					return ctrl.Result{RequeueAfter: 5 * time.Second}, err
@@ -180,7 +181,7 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 					return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 				}
 			}
-			r.EventRecorder.Event(df, corev1.EventTypeNormal, "Rollout", fmt.Sprintf("Shutting down master %s", master.Name))
+			r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Rollout", fmt.Sprintf("Shutting down master %s", master.Name))
 
 			// delete the old master, so that it gets recreated with the new version
 			log.Info("deleting master", "pod", master.Name)
@@ -191,11 +192,11 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 
 		// If we are here all are on latest version
-		r.EventRecorder.Event(df, corev1.EventTypeNormal, "Rollout", "Completed")
+		r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Rollout", "Completed")
 
 		// update status
-		df.Status.IsRollingUpdate = false
-		if err := r.Status().Update(ctx, df); err != nil {
+		dfi.df.Status.IsRollingUpdate = false
+		if err := r.Status().Update(ctx, dfi.df); err != nil {
 			log.Error(err, "could not update the Dragonfly object")
 			return ctrl.Result{Requeue: true}, err
 		}
@@ -203,7 +204,7 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, nil
 	} else {
 		log.Info("Checking if pod spec has changed")
-		isRollingUpdate, err := r.isRollingUpdate(ctx, df)
+		isRollingUpdate, err := r.isRollingUpdate(ctx, dfi.df)
 		if err != nil {
 			log.Error(err, "could not check if it is rolling update")
 			return ctrl.Result{Requeue: true}, nil
@@ -212,17 +213,17 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		// Check if the pod spec has changed
 		if isRollingUpdate {
 			log.Info("Pod spec has changed, performing a rollout")
-			r.EventRecorder.Event(df, corev1.EventTypeNormal, "Rollout", "Starting a rollout")
+			r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Rollout", "Starting a rollout")
 
 			// Start rollout and update status
 			// update status so that we can track progress
-			df.Status.IsRollingUpdate = true
-			if err := r.Status().Update(ctx, df); err != nil {
+			dfi.df.Status.IsRollingUpdate = true
+			if err := r.Status().Update(ctx, dfi.df); err != nil {
 				log.Error(err, "could not update the Dragonfly object")
 				return ctrl.Result{Requeue: true}, nil
 			}
 
-			r.EventRecorder.Event(df, corev1.EventTypeNormal, "Resources", "Performing a rollout")
+			r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Resources", "Performing a rollout")
 		}
 
 	}
@@ -365,6 +366,12 @@ func isFailureReason(reason string) bool {
 		reason == "CrashLoopBackOff" ||
 		reason == "RunContainerError"
 }
+
+func (r *DragonflyReconciler) GetClient() client.Client { return r.Client }
+
+func (r *DragonflyReconciler) GetEventRecorder() record.EventRecorder { return r.EventRecorder }
+
+func (r *DragonflyReconciler) GetScheme() *runtime.Scheme { return r.Scheme }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *DragonflyReconciler) SetupWithManager(mgr ctrl.Manager) error {
