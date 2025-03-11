@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"time"
@@ -78,7 +79,9 @@ func (r *DfPodLifeCycleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		Namespace: pod.Namespace,
 	}, r, log)
 	if err != nil {
-		log.Info("Pod does not belong to a Dragonfly instance")
+		if !apierrors.IsNotFound(err) {
+			log.Error(err, "Pod does not belong to a Dragonfly instance")
+		}
 		return ctrl.Result{}, nil
 	}
 

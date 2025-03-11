@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	"net"
@@ -320,6 +321,14 @@ func (dfi *DragonflyInstance) checkAndConfigureReplication(ctx context.Context) 
 	return nil
 }
 
+func (dfi *DragonflyInstance) getStatefulSet(ctx context.Context) (*appsv1.StatefulSet, error) {
+	var sts appsv1.StatefulSet
+	if err := dfi.client.Get(ctx, client.ObjectKey{Namespace: dfi.df.Namespace, Name: dfi.df.Name}, &sts); err != nil {
+		return nil, fmt.Errorf("failed to get statefulset %s/%s: %w", dfi.df.Namespace, dfi.df.Name, err)
+	}
+	return &sts, nil
+}
+
 func (dfi *DragonflyInstance) getPods(ctx context.Context) (*corev1.PodList, error) {
 	dfi.log.Info("getting all pods relevant to the instance")
 	var pods corev1.PodList
@@ -432,4 +441,29 @@ func (dfi *DragonflyInstance) ensureDragonflyResources(ctx context.Context) erro
 	}
 
 	return nil
+}
+
+// isRollingUpdate checks if the given Dragonfly object is in a rolling update state.
+func (dfi *DragonflyInstance) isRollingUpdate(ctx context.Context) (bool, error) {
+	sts, err := dfi.getStatefulSet(ctx)
+	if err != nil {
+		return false, err
+	}
+	pods, err := dfi.getPods(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	if sts.Status.UpdatedReplicas != sts.Status.Replicas {
+		for _, pod := range pods.Items {
+			onLatestVersion, err := isPodOnLatestVersion(&pod, sts)
+			if err != nil {
+				return false, err
+			}
+			if !onLatestVersion {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }

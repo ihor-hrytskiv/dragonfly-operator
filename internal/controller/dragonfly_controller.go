@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
@@ -62,8 +63,10 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	dfi, err := getDragonflyInstance(ctx, req.NamespacedName, r, log)
 	if err != nil {
-		log.Info("could not get Dragonfly instance")
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		if !apierrors.IsNotFound(err) {
+			log.Error(err, "could not get Dragonfly instance")
+		}
+		return ctrl.Result{}, nil
 	}
 
 	log.Info("Reconciling Dragonfly object")
@@ -75,7 +78,7 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if dfi.df.Status.IsRollingUpdate {
 		// This is a Rollout
 		log.Info("Rolling out new version")
-		statefulSet, err := r.getStatefulSet(ctx, dfi.df)
+		statefulSet, err := dfi.getStatefulSet(ctx)
 		if err != nil {
 			log.Error(err, "could not get statefulset")
 			return ctrl.Result{Requeue: true}, err
@@ -203,7 +206,7 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, nil
 	} else {
 		log.Info("Checking if pod spec has changed")
-		isRollingUpdate, err := r.isRollingUpdate(ctx, dfi.df)
+		isRollingUpdate, err := dfi.isRollingUpdate(ctx)
 		if err != nil {
 			log.Error(err, "could not check if it is rolling update")
 			return ctrl.Result{Requeue: true}, nil
@@ -254,45 +257,12 @@ func classifyPods(pods *corev1.PodList) (*corev1.Pod, []*corev1.Pod) {
 	return master, replicas
 }
 
-// isRollingUpdate checks if the given Dragonfly object is in a rolling update state.
-func (r *DragonflyReconciler) isRollingUpdate(ctx context.Context, df *dfv1alpha1.Dragonfly) (bool, error) {
-	sts, err := r.getStatefulSet(ctx, df)
-	if err != nil {
-		return false, err
-	}
-	pods, err := r.getPods(ctx, sts)
-	if err != nil {
-		return false, err
-	}
-
-	if sts.Status.UpdatedReplicas != sts.Status.Replicas {
-		for _, pod := range pods.Items {
-			onLatestVersion, err := isPodOnLatestVersion(&pod, sts)
-			if err != nil {
-				return false, err
-			}
-			if !onLatestVersion {
-				return true, nil
-			}
-		}
-	}
-	return false, nil
-}
-
 func (r *DragonflyReconciler) getDragonfly(ctx context.Context, key client.ObjectKey) (*dfv1alpha1.Dragonfly, error) {
 	df := &dfv1alpha1.Dragonfly{}
 	if err := r.Get(ctx, key, df); err != nil {
 		return nil, fmt.Errorf("failed to get dragonfly %s/%s: %w", key.Namespace, key.Name, err)
 	}
 	return df, nil
-}
-
-func (r *DragonflyReconciler) getStatefulSet(ctx context.Context, df *dfv1alpha1.Dragonfly) (*appsv1.StatefulSet, error) {
-	sts := &appsv1.StatefulSet{}
-	if err := r.Get(ctx, client.ObjectKey{Namespace: df.Namespace, Name: df.Name}, sts); err != nil {
-		return nil, fmt.Errorf("failed to get statefulset %s/%s: %w", df.Namespace, df.Name, err)
-	}
-	return sts, nil
 }
 
 func (r *DragonflyReconciler) getPods(ctx context.Context, sts *appsv1.StatefulSet) (*corev1.PodList, error) {
