@@ -220,13 +220,10 @@ type DragonflyStatus struct {
 
 	// Status of the Dragonfly Instance
 	// It can be one of the following:
-	// - "ready": The Dragonfly instance is ready to serve requests
-	// - "configuring-replication": The controller is updating the master of the Dragonfly instance
-	// - "resources-created": The Dragonfly instance resources were created but not yet configured
+	// - "Ready": The Dragonfly instance is ready to serve requests
+	// - "ResourcesCreated": The Dragonfly instance resources were created but not yet configured
+	// - "RollingUpdate": The Dragonfly instance is being updated
 	Phase string `json:"phase,omitempty"`
-
-	// IsRollingUpdate is true if the Dragonfly instance is being updated
-	IsRollingUpdate bool `json:"isRollingUpdate,omitempty"`
 }
 
 //+kubebuilder:object:root=true

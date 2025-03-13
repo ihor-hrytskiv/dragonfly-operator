@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -37,6 +38,12 @@ const (
 	PhaseRollingUpdate    string = "RollingUpdate"
 )
 
+var (
+	ErrNoMaster          = errors.New("no master found")
+	ErrIncorrectMasters  = errors.New("incorrect number of masters")
+	ErrIncorrectReplicas = errors.New("incorrect number of replicas")
+)
+
 // isPodOnLatestVersion returns if the Given pod is on the updatedRevision
 // of the given statefulset or not
 func isPodOnLatestVersion(pod *corev1.Pod, sts *appsv1.StatefulSet) bool {
@@ -47,12 +54,7 @@ func isPodOnLatestVersion(pod *corev1.Pod, sts *appsv1.StatefulSet) bool {
 	return false
 }
 
-func isStableState(ctx context.Context, pod *corev1.Pod) (bool, error) {
-	// wait until pod IP is ready
-	if pod.Status.PodIP == "" || pod.Status.Phase != corev1.PodRunning {
-		return false, nil
-	}
-
+func isReplicaStable(ctx context.Context, pod *corev1.Pod) (bool, error) {
 	redisClient := redis.NewClient(&redis.Options{
 		Addr: fmt.Sprintf("%s:%d", pod.Status.PodIP, resources.DragonflyAdminPort),
 	})
@@ -106,19 +108,28 @@ func getGVK(obj client.Object, scheme *runtime.Scheme) schema.GroupVersionKind {
 }
 
 // classifyPods classifies the given pods into master and replicas.
-func classifyPods(pods *corev1.PodList) (*corev1.Pod, []*corev1.Pod) {
-	master := &corev1.Pod{}
+func classifyPods(pods *corev1.PodList) (*corev1.Pod, []*corev1.Pod, error) {
+	var master *corev1.Pod
 	replicas := make([]*corev1.Pod, 0)
-	for _, pod := range pods.Items {
-		if _, ok := pod.Labels[resources.Role]; ok {
-			if isReplica(pod) {
-				replicas = append(replicas, &pod)
-			} else if isMaster(pod) {
-				master = &pod
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if isReplica(*pod) {
+			replicas = append(replicas, pod)
+		} else {
+			if isMaster(*pod) && master == nil {
+				master = pod
+			} else {
+				return nil, nil, ErrIncorrectMasters
 			}
 		}
 	}
-	return master, replicas
+	if master == nil {
+		return nil, nil, ErrNoMaster
+	}
+	if len(replicas) != len(pods.Items)-1 {
+		return nil, nil, ErrIncorrectReplicas
+	}
+	return master, replicas, nil
 }
 
 func getReadyPod(pods *corev1.PodList) (*corev1.Pod, bool) {
@@ -134,6 +145,7 @@ func isMaster(pod corev1.Pod) bool {
 	if role, ok := pod.Labels[resources.Role]; ok && role == resources.Master {
 		return true
 	}
+
 	return false
 }
 
@@ -141,6 +153,7 @@ func isReplica(pod corev1.Pod) bool {
 	if role, ok := pod.Labels[resources.Role]; ok && role == resources.Replica {
 		return true
 	}
+
 	return false
 }
 
@@ -154,6 +167,7 @@ func isPodReady(pod corev1.Pod) bool {
 			return isDragonflyContainerReady(pod.Status.ContainerStatuses)
 		}
 	}
+
 	return false
 }
 
@@ -172,6 +186,18 @@ func isPodMarkedForDeletion(pod corev1.Pod) bool {
 		if !pod.DeletionTimestamp.IsZero() || (c.Type == corev1.DisruptionTarget && c.Status == corev1.ConditionTrue) {
 			return true
 		}
+	}
+	return false
+}
+
+func isAllPodsReady(pods *corev1.PodList, sts *appsv1.StatefulSet) bool {
+	if len(pods.Items) == int(*sts.Spec.Replicas) {
+		for _, pod := range pods.Items {
+			if !isPodReady(pod) {
+				return false
+			}
+		}
+		return true
 	}
 	return false
 }

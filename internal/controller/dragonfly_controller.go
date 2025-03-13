@@ -22,6 +22,7 @@ import (
 	dfv1alpha1 "github.com/dragonflydb/dragonfly-operator/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -67,17 +68,36 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	statefulSet, err := dfi.getStatefulSet(ctx)
 	if err != nil {
-		log.Error(err, "could not get statefulset")
 		return ctrl.Result{Requeue: true}, err
 	}
 
 	pods, err := dfi.getPods(ctx)
 	if err != nil {
-		log.Error(err, "could not list pods")
 		return ctrl.Result{Requeue: true}, err
 	}
 
-	if dfi.df.Status.Phase == PhaseReady {
+	switch dfi.df.Status.Phase {
+	case PhaseResourcesCreated:
+		if !isAllPodsReady(pods, statefulSet) {
+			log.Info("Waiting for all pods to be ready")
+			return ctrl.Result{Requeue: true}, nil
+		}
+
+		if _, _, err := classifyPods(pods); err != nil {
+			log.Error(err, "failed to classify pods as master and replicas")
+			return ctrl.Result{Requeue: true}, nil
+		} else {
+			dfi.log.Info("all pods are configured correctly", "dfi", dfi.df.Name)
+			// update status
+
+			if err := dfi.updateStatus(ctx, PhaseReady); err != nil {
+				if !apierrors.IsConflict(err) {
+					log.Error(err, "could not update the Dragonfly object")
+				}
+				return ctrl.Result{Requeue: true}, nil
+			}
+		}
+	case PhaseReady:
 		log.Info("Checking if pod spec has changed")
 		// perform a rollout only if the pod spec has changed
 		// Check if the pod spec has changed
@@ -87,28 +107,27 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 			// Start rollout and update status
 			// update status so that we can track progress
-			dfi.df.Status.Phase = PhaseRollingUpdate
-			if err := r.Status().Update(ctx, dfi.df); err != nil {
-				log.Error(err, "could not update the Dragonfly object")
+			if err := dfi.updateStatus(ctx, PhaseRollingUpdate); err != nil {
+				if !apierrors.IsConflict(err) {
+					log.Error(err, "could not update the Dragonfly object")
+				}
 				return ctrl.Result{Requeue: true}, nil
 			}
 
 			r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Resources", "Performing a rollout")
 			return ctrl.Result{Requeue: true}, nil
 		}
-	} else {
-		if dfi.df.Status.Phase == PhaseRollingUpdate {
-			// This is a Rollout
-			log.Info("Rolling out new version")
-		}
+	case PhaseRollingUpdate:
+		// This is a Rollout
+		log.Info("Rolling out new version")
 
-		if len(pods.Items) != int(*statefulSet.Spec.Replicas) {
+		if !isAllPodsReady(pods, statefulSet) {
 			log.Info("Waiting for all replicas to be ready")
 			return ctrl.Result{Requeue: true}, nil
 		}
 
 		// filter pods to master and replicas
-		master, replicas := classifyPods(pods)
+		master, replicas, err := classifyPods(pods)
 		if err != nil {
 			log.Error(err, "failed to classify pods as master and replicas")
 			return ctrl.Result{Requeue: true}, nil
@@ -117,7 +136,7 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		// We want to update the replicas first then the master
 		// We want to have at most one updated replica in full sync phase at a time
 		// if not, requeue
-		if result, err := dfi.checkUpdatedReplicas(ctx, statefulSet, replicas); !result.IsZero() || err != nil {
+		if result, err := dfi.verifyUpdatedReplicas(ctx, statefulSet, replicas); !result.IsZero() || err != nil {
 			return result, err
 		}
 
@@ -157,10 +176,11 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Rollout", "Completed")
 
 		// update status
-		dfi.df.Status.Phase = PhaseReady
-		if err := r.Status().Update(ctx, dfi.df); err != nil {
-			log.Error(err, "could not update the Dragonfly object")
-			return ctrl.Result{Requeue: true}, err
+		if err := dfi.updateStatus(ctx, PhaseReady); err != nil {
+			if !apierrors.IsConflict(err) {
+				log.Error(err, "could not update the Dragonfly object")
+			}
+			return ctrl.Result{Requeue: true}, nil
 		}
 
 		return ctrl.Result{}, nil

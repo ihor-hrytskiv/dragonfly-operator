@@ -121,7 +121,7 @@ func (r *DfPodLifeCycleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		// Check if there is an active master
 		if isMaster(pod) {
 			log.Info("master is being removed")
-			if dfi.df.Status.IsRollingUpdate {
+			if dfi.df.Status.Phase == PhaseRollingUpdate {
 				log.Info("rolling update in progress. nothing to do")
 				return ctrl.Result{}, nil
 			}
@@ -144,7 +144,7 @@ func (r *DfPodLifeCycleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	if role, ok := pod.Labels[resources.Role]; ok && isPodReady(pod) {
-		if dfi.df.Status.IsRollingUpdate {
+		if dfi.df.Status.Phase == PhaseRollingUpdate {
 			log.Info("rolling update in progress. nothing to do")
 			return ctrl.Result{}, nil
 		}

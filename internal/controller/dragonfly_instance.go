@@ -63,6 +63,7 @@ func getDragonflyInstance(ctx context.Context, namespacedName types.NamespacedNa
 	var df dfv1alpha1.Dragonfly
 	err := c.Get(ctx, namespacedName, &df)
 	if err != nil {
+		log.Error(err, "failed to get dragonfly object")
 		return nil, err
 	}
 
@@ -118,13 +119,13 @@ func (dfi *DragonflyInstance) configureReplication(ctx context.Context, pods *co
 }
 
 func (dfi *DragonflyInstance) updateStatus(ctx context.Context, phase string) error {
-	// get latest df object first
-	if err := dfi.client.Get(ctx, types.NamespacedName{
-		Name:      dfi.df.Name,
-		Namespace: dfi.df.Namespace,
-	}, dfi.df); err != nil {
-		return err
-	}
+	//// get latest df object first
+	//if err := dfi.client.Get(ctx, types.NamespacedName{
+	//	Name:      dfi.df.Name,
+	//	Namespace: dfi.df.Namespace,
+	//}, dfi.df); err != nil {
+	//	return err
+	//}
 
 	dfi.log.Info("Updating status", "phase", phase)
 	dfi.df.Status.Phase = phase
@@ -293,19 +294,21 @@ func (dfi *DragonflyInstance) checkAndConfigureReplication(ctx context.Context) 
 func (dfi *DragonflyInstance) getStatefulSet(ctx context.Context) (*appsv1.StatefulSet, error) {
 	var sts appsv1.StatefulSet
 	if err := dfi.client.Get(ctx, client.ObjectKey{Namespace: dfi.df.Namespace, Name: dfi.df.Name}, &sts); err != nil {
-		return nil, fmt.Errorf("failed to get statefulset %s/%s: %w", dfi.df.Namespace, dfi.df.Name, err)
+		dfi.log.Error(err, "failed to get statefulset", "namespace", dfi.df.Namespace, "name", dfi.df.Name)
+		return nil, err
 	}
 	return &sts, nil
 }
 
 func (dfi *DragonflyInstance) getPods(ctx context.Context) (*corev1.PodList, error) {
-	dfi.log.Info("getting all pods relevant to the instance")
+	dfi.log.Info("Getting all pods relevant to the instance")
 	var pods corev1.PodList
 	if err := dfi.client.List(ctx, &pods, client.InNamespace(dfi.df.Namespace), client.MatchingLabels{
 		resources.DragonflyNameLabelKey:    dfi.df.Name,
 		resources.KubernetesPartOfLabelKey: "dragonfly",
 	},
 	); err != nil {
+		dfi.log.Error(err, "failed to list pods relevant to the instance")
 		return nil, err
 	}
 
@@ -368,7 +371,7 @@ func (dfi *DragonflyInstance) replicaOfNoOne(ctx context.Context, pod *corev1.Po
 
 // ensureDragonflyResources makes sure the dragonfly resources exist and are up to date.
 func (dfi *DragonflyInstance) ensureDragonflyResources(ctx context.Context) (ctrl.Result, error) {
-	dfi.log.Info(fmt.Sprintf("Ensuring dragonfly resources for %s", dfi.df.Name))
+	dfi.log.Info(fmt.Sprintf("Ensuring dragonfly resources"))
 	dragonflyResources, err := resources.GenerateDragonflyResources(dfi.df)
 	if err != nil {
 		dfi.log.Error(err, "failed to generate dragonfly resources")
@@ -376,7 +379,11 @@ func (dfi *DragonflyInstance) ensureDragonflyResources(ctx context.Context) (ctr
 	}
 
 	for _, resource := range dragonflyResources {
-		resourceInfo := fmt.Sprintf("%s/%s/%s", getGVK(resource, dfi.scheme).Kind, resource.GetNamespace(), resource.GetName())
+		resourceInfo := map[string]string{
+			"Kind":      getGVK(resource, dfi.scheme).Kind,
+			"Namespace": resource.GetNamespace(),
+			"Name":      resource.GetName(),
+		}
 		existingResource := resource.DeepCopyObject().(client.Object)
 
 		if err = dfi.client.Get(ctx, client.ObjectKey{
@@ -385,7 +392,7 @@ func (dfi *DragonflyInstance) ensureDragonflyResources(ctx context.Context) (ctr
 			existingResource,
 		); err != nil {
 			if apierrors.IsNotFound(err) {
-				dfi.log.Info(fmt.Sprintf("Creating resource: %s", resourceInfo))
+				dfi.log.Info("Creating resource", "resource", resourceInfo)
 				if err = dfi.client.Create(ctx, resource); err != nil {
 					dfi.log.Error(err, "could not create resource", "resource", resourceInfo)
 					return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
@@ -396,7 +403,7 @@ func (dfi *DragonflyInstance) ensureDragonflyResources(ctx context.Context) (ctr
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 
-		dfi.log.Info(fmt.Sprintf("Updating resource: %s", resourceInfo))
+		dfi.log.Info("Updating resource", "resource", resourceInfo)
 		if err = dfi.client.Update(ctx, resource); err != nil {
 			if !apierrors.IsConflict(err) {
 				dfi.log.Error(err, "could not update resource", "resource", resourceInfo)
@@ -422,46 +429,39 @@ func (dfi *DragonflyInstance) ensureDragonflyResources(ctx context.Context) (ctr
 
 // isRollingUpdate checks if the given Dragonfly object is in a rolling update state.
 func (dfi *DragonflyInstance) isRollingUpdate(sts *appsv1.StatefulSet, pods *corev1.PodList) bool {
-	//TODO: remove
-	dfi.log.Info("Checking if it is a rolling update", "sts", sts.Name, "replicas", sts.Status.Replicas, "updatedReplicas", sts.Status.UpdatedReplicas)
 	if sts.Status.UpdatedReplicas != sts.Status.Replicas {
-		//TODO: remove
-		dfi.log.Info("replicas are not equal to updated replicas")
 		for _, pod := range pods.Items {
-			//TODO: remove
-			dfi.log.Info("checking pod", "pod", pod.Name, "sts", sts.Name)
 			if !isPodOnLatestVersion(&pod, sts) {
-				//TODO: remove
-				dfi.log.Info("pod is not on latest version", "pod", pod.Name, "sts", sts.Name)
 				return true
 			}
 		}
 	}
+
 	return false
 }
 
 // checkUpdatedReplicas checks if the updated replicas are in a stable state
-func (dfi *DragonflyInstance) checkUpdatedReplicas(ctx context.Context, sts *appsv1.StatefulSet, replicas []*corev1.Pod) (ctrl.Result, error) {
-	fullSyncedUpdatedReplicas := 0
+func (dfi *DragonflyInstance) verifyUpdatedReplicas(ctx context.Context, sts *appsv1.StatefulSet, replicas []*corev1.Pod) (ctrl.Result, error) {
+	fullSyncedReplicas := 0
 	for _, replica := range replicas {
 		if isPodOnLatestVersion(replica, sts) {
 			dfi.log.Info("New Replica found. Checking if replica had a full sync", "pod", replica.Name)
-			isStableState, err := isStableState(ctx, replica)
+			ok, err := isReplicaStable(ctx, replica)
 			if err != nil {
 				dfi.log.Error(err, "could not check if pod is in stable state")
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 			}
 
-			if !isStableState {
+			if !ok {
 				dfi.log.Info("Not all new replicas are in stable status yet", "pod", replica.Name, "reason", err)
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 			}
 			dfi.log.Info("Replica is in stable state", "pod", replica.Name)
-			fullSyncedUpdatedReplicas++
+			fullSyncedReplicas++
 		}
 	}
 
-	dfi.log.Info(fmt.Sprintf("%d/%d replicas are in stable state", fullSyncedUpdatedReplicas, len(replicas)))
+	dfi.log.Info("Replicas where verified", "synced_replicas", fullSyncedReplicas, "replicas", len(replicas))
 
 	return ctrl.Result{}, nil
 }
@@ -474,7 +474,7 @@ func (dfi *DragonflyInstance) deleteOldReplicas(ctx context.Context, sts *appsv1
 			dfi.log.Info("deleting replica", "pod", replica.Name)
 			dfi.eventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Rollout", "Deleting replica")
 			if err := dfi.client.Delete(ctx, replica); err != nil {
-				dfi.log.Error(err, "could not delete pod")
+				dfi.log.Error(err, "failed not delete pod")
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 			}
 
