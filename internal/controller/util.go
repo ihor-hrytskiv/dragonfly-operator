@@ -18,7 +18,6 @@ package controller
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -33,9 +32,9 @@ import (
 )
 
 const (
-	PhaseResourcesCreated string = "resources-created"
-
-	PhaseReady string = "ready"
+	PhaseResourcesCreated string = "ResourcesCreated"
+	PhaseReady            string = "Ready"
+	PhaseRollingUpdate    string = "RollingUpdate"
 )
 
 // isPodOnLatestVersion returns if the Given pod is on the updatedRevision
@@ -70,7 +69,7 @@ func isStableState(ctx context.Context, pod *corev1.Pod) (bool, error) {
 	}
 
 	if info == "" {
-		return false, errors.New("empty info")
+		return false, fmt.Errorf("empty info")
 	}
 
 	data := map[string]string{}
@@ -112,9 +111,9 @@ func classifyPods(pods *corev1.PodList) (*corev1.Pod, []*corev1.Pod) {
 	replicas := make([]*corev1.Pod, 0)
 	for _, pod := range pods.Items {
 		if _, ok := pod.Labels[resources.Role]; ok {
-			if isReplica(&pod) {
+			if isReplica(pod) {
 				replicas = append(replicas, &pod)
-			} else if isMaster(&pod) {
+			} else if isMaster(pod) {
 				master = &pod
 			}
 		}
@@ -122,16 +121,57 @@ func classifyPods(pods *corev1.PodList) (*corev1.Pod, []*corev1.Pod) {
 	return master, replicas
 }
 
-func isMaster(pod *corev1.Pod) bool {
+func getReadyPod(pods *corev1.PodList) (*corev1.Pod, bool) {
+	for _, pod := range pods.Items {
+		if isPodReady(pod) {
+			return &pod, true
+		}
+	}
+	return nil, false
+}
+
+func isMaster(pod corev1.Pod) bool {
 	if role, ok := pod.Labels[resources.Role]; ok && role == resources.Master {
 		return true
 	}
 	return false
 }
 
-func isReplica(pod *corev1.Pod) bool {
+func isReplica(pod corev1.Pod) bool {
 	if role, ok := pod.Labels[resources.Role]; ok && role == resources.Replica {
 		return true
+	}
+	return false
+}
+
+func isPodReady(pod corev1.Pod) bool {
+	if isPodMarkedForDeletion(pod) {
+		return false
+	}
+
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue && pod.Status.PodIP != "" {
+			return isDragonflyContainerReady(pod.Status.ContainerStatuses)
+		}
+	}
+	return false
+}
+
+func isDragonflyContainerReady(containerStatuses []corev1.ContainerStatus) bool {
+	for _, cs := range containerStatuses {
+		if cs.Name == resources.DragonflyContainerName && cs.Ready {
+			return true
+		}
+	}
+
+	return false
+}
+
+func isPodMarkedForDeletion(pod corev1.Pod) bool {
+	for _, c := range pod.Status.Conditions {
+		if !pod.DeletionTimestamp.IsZero() || (c.Type == corev1.DisruptionTarget && c.Status == corev1.ConditionTrue) {
+			return true
+		}
 	}
 	return false
 }

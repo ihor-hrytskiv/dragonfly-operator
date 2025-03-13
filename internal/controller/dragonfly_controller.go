@@ -19,9 +19,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"time"
-
 	dfv1alpha1 "github.com/dragonflydb/dragonfly-operator/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -32,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"time"
 )
 
 // DragonflyReconciler reconciles a Dragonfly object
@@ -59,10 +57,7 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	dfi, err := getDragonflyInstance(ctx, req.NamespacedName, r, log)
 	if err != nil {
-		if !apierrors.IsNotFound(err) {
-			log.Error(err, "could not get Dragonfly instance")
-		}
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
 	log.Info("Reconciling Dragonfly object")
@@ -70,19 +65,41 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return result, err
 	}
 
-	if dfi.df.Status.IsRollingUpdate {
-		// This is a Rollout
-		log.Info("Rolling out new version")
-		statefulSet, err := dfi.getStatefulSet(ctx)
-		if err != nil {
-			log.Error(err, "could not get statefulset")
-			return ctrl.Result{Requeue: true}, err
-		}
+	statefulSet, err := dfi.getStatefulSet(ctx)
+	if err != nil {
+		log.Error(err, "could not get statefulset")
+		return ctrl.Result{Requeue: true}, err
+	}
 
-		pods, err := dfi.getPods(ctx)
-		if err != nil {
-			log.Error(err, "could not list pods")
-			return ctrl.Result{Requeue: true}, err
+	pods, err := dfi.getPods(ctx)
+	if err != nil {
+		log.Error(err, "could not list pods")
+		return ctrl.Result{Requeue: true}, err
+	}
+
+	if dfi.df.Status.Phase == PhaseReady {
+		log.Info("Checking if pod spec has changed")
+		// perform a rollout only if the pod spec has changed
+		// Check if the pod spec has changed
+		if dfi.isRollingUpdate(statefulSet, pods) {
+			log.Info("Pod spec has changed, performing a rollout")
+			r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Rollout", "Starting a rollout")
+
+			// Start rollout and update status
+			// update status so that we can track progress
+			dfi.df.Status.Phase = PhaseRollingUpdate
+			if err := r.Status().Update(ctx, dfi.df); err != nil {
+				log.Error(err, "could not update the Dragonfly object")
+				return ctrl.Result{Requeue: true}, nil
+			}
+
+			r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Resources", "Performing a rollout")
+			return ctrl.Result{Requeue: true}, nil
+		}
+	} else {
+		if dfi.df.Status.Phase == PhaseRollingUpdate {
+			// This is a Rollout
+			log.Info("Rolling out new version")
 		}
 
 		if len(pods.Items) != int(*statefulSet.Spec.Replicas) {
@@ -93,7 +110,7 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		// filter pods to master and replicas
 		master, replicas := classifyPods(pods)
 		if err != nil {
-			log.Error(err, "could not get master and replicas")
+			log.Error(err, "failed to classify pods as master and replicas")
 			return ctrl.Result{Requeue: true}, nil
 		}
 
@@ -110,24 +127,20 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			return result, err
 		}
 
-		var latestReplica *corev1.Pod
-		if len(replicas) > 0 {
-			latestReplica, err = dfi.getLatestReplica(ctx, statefulSet)
-			if err != nil {
-				log.Error(err, "could not get latest replica")
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
-			}
-		}
-
 		// If we are here it means that all replicas
 		// are on latest version
 		if !isPodOnLatestVersion(master, statefulSet) {
 			// Update master now
-			if latestReplica != nil {
+			if len(replicas) > 0 {
+				replica, err := dfi.getLatestReplica(ctx, statefulSet)
+				if replica == nil || err != nil {
+					log.Error(err, "could not get latest replica")
+					return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+				}
 				log.Info("Running REPLTAKEOVER on replica", "pod", master.Name)
-				if err := dfi.replTakeover(ctx, latestReplica); err != nil {
+				if err := dfi.replTakeover(ctx, replica); err != nil {
 					log.Error(err, "could not update master")
-					return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+					return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 				}
 			}
 			r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Rollout", fmt.Sprintf("Shutting down master %s", master.Name))
@@ -144,39 +157,16 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Rollout", "Completed")
 
 		// update status
-		dfi.df.Status.IsRollingUpdate = false
+		dfi.df.Status.Phase = PhaseReady
 		if err := r.Status().Update(ctx, dfi.df); err != nil {
 			log.Error(err, "could not update the Dragonfly object")
 			return ctrl.Result{Requeue: true}, err
 		}
 
 		return ctrl.Result{}, nil
-	} else {
-		log.Info("Checking if pod spec has changed")
-		isRollingUpdate, err := dfi.isRollingUpdate(ctx)
-		if err != nil {
-			log.Error(err, "could not check if it is rolling update")
-			return ctrl.Result{Requeue: true}, nil
-		}
-		// perform a rollout only if the pod spec has changed
-		// Check if the pod spec has changed
-		if isRollingUpdate {
-			log.Info("Pod spec has changed, performing a rollout")
-			r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Rollout", "Starting a rollout")
-
-			// Start rollout and update status
-			// update status so that we can track progress
-			dfi.df.Status.IsRollingUpdate = true
-			if err := r.Status().Update(ctx, dfi.df); err != nil {
-				log.Error(err, "could not update the Dragonfly object")
-				return ctrl.Result{Requeue: true}, nil
-			}
-
-			r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Resources", "Performing a rollout")
-		}
-
 	}
-	return ctrl.Result{Requeue: true}, nil
+
+	return ctrl.Result{}, nil
 }
 
 func (r *DragonflyReconciler) GetClient() client.Client { return r.Client }
