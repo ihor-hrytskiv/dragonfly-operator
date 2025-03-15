@@ -18,106 +18,49 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"net"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	"strconv"
 	"strings"
 
 	"github.com/dragonflydb/dragonfly-operator/internal/resources"
 	"github.com/redis/go-redis/v9"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
-	PhaseResourcesCreated string = "resources-created"
+	PhaseResourcesCreated string = "ResourcesCreated"
+	PhaseReady            string = "Ready"
+	PhaseRollingUpdate    string = "RollingUpdate"
+)
 
-	PhaseReady string = "ready"
+var (
+	ErrNoMaster          = errors.New("no master found")
+	ErrIncorrectMasters  = errors.New("incorrect number of masters")
+	ErrIncorrectReplicas = errors.New("incorrect number of replicas")
 )
 
 // isPodOnLatestVersion returns if the Given pod is on the updatedRevision
 // of the given statefulset or not
-func isPodOnLatestVersion(pod *corev1.Pod, statefulSet *appsv1.StatefulSet) (bool, error) {
-	// Get the pod's revision
-	podRevision, ok := pod.Labels[appsv1.StatefulSetRevisionLabel]
-	if !ok {
-		return false, fmt.Errorf("pod %s/%s does not have a revision label", pod.Namespace, pod.Name)
+func isPodOnLatestVersion(pod *corev1.Pod, sts *appsv1.StatefulSet) bool {
+	if podRevision, ok := pod.Labels[appsv1.StatefulSetRevisionLabel]; ok && podRevision == sts.Status.UpdateRevision {
+		return true
 	}
 
-	// Compare the two
-	if podRevision == statefulSet.Status.UpdateRevision {
-		return true, nil
-	}
-
-	return false, nil
+	return false
 }
 
-// getLatestReplica returns a replica pod which is on the latest version
-// of the given statefulset
-func getLatestReplica(ctx context.Context, c client.Client, statefulSet *appsv1.StatefulSet) (*corev1.Pod, error) {
-	// Get the list of pods
-	podList := &corev1.PodList{}
-	err := c.List(ctx, podList, &client.ListOptions{
-		Namespace: statefulSet.Namespace,
-		LabelSelector: labels.SelectorFromValidatedSet(map[string]string{
-			"app":                              statefulSet.Name,
-			resources.KubernetesPartOfLabelKey: "dragonfly",
-		}),
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	// Iterate over the pods and find a replica which is on the latest version
-	for _, pod := range podList.Items {
-
-		isLatest, err := isPodOnLatestVersion(&pod, statefulSet)
-		if err != nil {
-			return nil, err
-		}
-
-		if isLatest && pod.Labels[resources.Role] == resources.Replica {
-			return &pod, nil
-		}
-	}
-
-	return nil, errors.New("no replica pod found on latest version")
-
-}
-
-// replTakeover runs the replTakeOver on the given replica pod
-func replTakeover(ctx context.Context, c client.Client, newMaster *corev1.Pod) error {
+func isReplicaStable(ctx context.Context, pod *corev1.Pod) (bool, error) {
 	redisClient := redis.NewClient(&redis.Options{
-		Addr: fmt.Sprintf("%s:%d", newMaster.Status.PodIP, resources.DragonflyAdminPort),
-	})
-	defer redisClient.Close()
-
-	resp, err := redisClient.Do(ctx, "repltakeover", "10000").Result()
-	if err != nil {
-		return fmt.Errorf("error running REPLTAKEOVER command: %w", err)
-	}
-
-	if resp != "OK" {
-		return fmt.Errorf("response of `REPLTAKEOVER` on replica is not OK: %s", resp)
-	}
-
-	// update the label on the pod
-	newMaster.Labels[resources.Role] = resources.Master
-	if err := c.Update(ctx, newMaster); err != nil {
-		return fmt.Errorf("error updating the role label on the pod: %w", err)
-	}
-	return nil
-}
-
-func isStableState(ctx context.Context, pod *corev1.Pod) (bool, error) {
-	// wait until pod IP is ready
-	if pod.Status.PodIP == "" || pod.Status.Phase != corev1.PodRunning {
-		return false, nil
-	}
-
-	redisClient := redis.NewClient(&redis.Options{
-		Addr: fmt.Sprintf("%s:%d", pod.Status.PodIP, resources.DragonflyAdminPort),
+		Addr: net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(resources.DragonflyAdminPort)),
 	})
 	defer redisClient.Close()
 
@@ -132,7 +75,7 @@ func isStableState(ctx context.Context, pod *corev1.Pod) (bool, error) {
 	}
 
 	if info == "" {
-		return false, errors.New("empty info")
+		return false, fmt.Errorf("empty info")
 	}
 
 	data := map[string]string{}
@@ -157,4 +100,151 @@ func isStableState(ctx context.Context, pod *corev1.Pod) (bool, error) {
 	}
 
 	return true, nil
+}
+
+// getGVK returns the GroupVersionKind of the given object.
+func getGVK(obj client.Object, scheme *runtime.Scheme) schema.GroupVersionKind {
+	gvk, err := apiutil.GVKForObject(obj, scheme)
+	if err != nil {
+		return schema.GroupVersionKind{Group: "Unknown", Version: "Unknown", Kind: "Unknown"}
+	}
+	return gvk
+}
+
+func getMaster(pods *corev1.PodList) (*corev1.Pod, error) {
+	var master *corev1.Pod
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if isMaster(*pod) && isPodReady(*pod) {
+			if master != nil {
+				return nil, ErrIncorrectMasters
+			}
+			master = pod
+		}
+	}
+	if master == nil {
+		return nil, ErrNoMaster
+	}
+	return master, nil
+}
+
+// classifyPods classifies the given pods into master and replicas.
+func classifyPods(pods *corev1.PodList) (*corev1.Pod, []*corev1.Pod, error) {
+	var master *corev1.Pod
+	replicas := make([]*corev1.Pod, 0)
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if isReplica(*pod) {
+			replicas = append(replicas, pod)
+		} else {
+			if isMaster(*pod) {
+				if master != nil {
+					return nil, nil, ErrIncorrectMasters
+				}
+				master = pod
+			}
+		}
+	}
+	if master == nil {
+		return nil, nil, ErrNoMaster
+	}
+	if len(replicas) != len(pods.Items)-1 {
+		//TODO: remove
+		return master, replicas, ErrIncorrectReplicas
+		//return master, nil, ErrIncorrectReplicas
+	}
+	return master, replicas, nil
+}
+
+func getReadyPod(pods *corev1.PodList) (*corev1.Pod, bool) {
+	for _, pod := range pods.Items {
+		if isPodReady(pod) {
+			return &pod, true
+		}
+	}
+	return nil, false
+}
+
+func roleExists(pod corev1.Pod) bool {
+	_, ok := pod.Labels[resources.Role]
+	return ok
+}
+
+func isMaster(pod corev1.Pod) bool {
+	if role, ok := pod.Labels[resources.Role]; ok && role == resources.Master {
+		return true
+	}
+
+	return false
+}
+
+func isReplica(pod corev1.Pod) bool {
+	if role, ok := pod.Labels[resources.Role]; ok && role == resources.Replica {
+		return true
+	}
+
+	return false
+}
+
+func isPodReady(pod corev1.Pod) bool {
+	if isPodMarkedForDeletion(pod) {
+		return false
+	}
+
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue && pod.Status.PodIP != "" {
+			return isDragonflyContainerReady(pod.Status.ContainerStatuses)
+		}
+	}
+
+	return false
+}
+
+func isPodCrashLoopBackOff(pod corev1.Pod) bool {
+	for _, containerStatus := range pod.Status.ContainerStatuses {
+		if containerStatus.State.Waiting != nil && containerStatus.State.Waiting.Reason == "CrashLoopBackOff" {
+			return true
+		}
+	}
+	return false
+}
+
+func isDragonflyContainerReady(containerStatuses []corev1.ContainerStatus) bool {
+	for _, cs := range containerStatuses {
+		if cs.Name == resources.DragonflyContainerName && cs.Ready {
+			return true
+		}
+	}
+
+	return false
+}
+
+func isPodMarkedForDeletion(pod corev1.Pod) bool {
+	for _, c := range pod.Status.Conditions {
+		if !pod.DeletionTimestamp.IsZero() || (c.Type == corev1.DisruptionTarget && c.Status == corev1.ConditionTrue) {
+			return true
+		}
+	}
+	return false
+}
+
+func isAllPodsReady(pods *corev1.PodList, sts *appsv1.StatefulSet) bool {
+	if len(pods.Items) == int(*sts.Spec.Replicas) {
+		for _, pod := range pods.Items {
+			if !isPodReady(pod) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func createPatch(obj any) (client.Patch, error) {
+	patchBytes, err := json.Marshal(obj)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal patch object: %w", err)
+	}
+
+	return client.RawPatch(types.MergePatchType, patchBytes), nil
 }
