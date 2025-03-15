@@ -18,24 +18,20 @@ package controller
 
 import (
 	"context"
-	"fmt"
-	"time"
-
+	"errors"
 	"github.com/dragonflydb/dragonfly-operator/internal/resources"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"time"
 )
 
 type DfPodLifeCycleReconciler struct {
-	client.Client
-	Scheme        *runtime.Scheme
-	EventRecorder record.EventRecorder
+	Reconciler
 }
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
@@ -50,137 +46,113 @@ type DfPodLifeCycleReconciler struct {
 func (r *DfPodLifeCycleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
-	log.Info("Received", "pod", req.NamespacedName)
+	log.Info("received", "pod", req.NamespacedName)
 	var pod corev1.Pod
-	err := r.Client.Get(ctx, req.NamespacedName, &pod, &client.GetOptions{})
+	if err := r.Client.Get(ctx, req.NamespacedName, &pod, &client.GetOptions{}); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	dfName, ok := pod.Labels[resources.DragonflyNameLabelKey]
+	if !ok {
+		log.Info("failed to get Dragonfly name from pod labels")
+		return ctrl.Result{}, nil
+	}
+
+	dfi, err := r.getDragonflyInstance(ctx, types.NamespacedName{
+		Name:      dfName,
+		Namespace: pod.Namespace,
+	}, log)
 	if err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// check for pod readiness
-	isPodReady := false
-	for _, condition := range pod.Status.Conditions {
-		if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
-			isPodReady = true
-			break
-		}
-	}
-
-	dfi, err := GetDragonflyInstanceFromPod(ctx, r.Client, &pod, log)
+	pods, err := dfi.getPods(ctx)
 	if err != nil {
-		log.Info("Pod does not belong to a Dragonfly instance")
-		return ctrl.Result{}, nil
-	}
-
-	// Get the role of the pod
-	role, roleExists := pod.Labels[resources.Role]
-	if !isPodReady {
-		if roleExists && role == "master" {
-			log.Info("Master pod is not ready, initiating failover", "pod", req.NamespacedName)
-			err := dfi.configureReplication(ctx)
-			if err != nil {
-				log.Error(err, "Failed to initiate failover")
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
-			}
-			return ctrl.Result{}, nil
-		} else {
-			log.Info("Pod is not ready yet", "pod", req.NamespacedName)
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-	}
-
-	if dfi.df.Status.Phase == "" {
-		// retry after resources are created
-		// Phase should be initialized by the time this is called
-		log.Info("Dragonfly object is not initialized yet")
+		log.Error(err, "could not list pods")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	// Given a Pod Update, What do you do?
-	// If it does not have a `resources.Role`,
-	// - If the Dragonfly Object is in initialization phase, Do a init replication i.e set for first time.
-	// - If the Dragonfly object status is Ready, Then this is a pod restart.
-	// 	- If there is master already, add this as replica
-	//	- If there is no master, find a healthy instance and mark it as master
-	//
 	// New pod with No resources.Role
-	if !roleExists {
-		log.Info("No replication role was set yet", "phase", dfi.df.Status.Phase)
-		if dfi.df.Status.Phase == PhaseResourcesCreated {
-			// Make it ready
-			log.Info("Dragonfly object is only initialized. Configuring replication for the first time")
-			if err = dfi.configureReplication(ctx); err != nil {
-				log.Info("could not initialize replication. will retry", "error", err)
+	if isPodReady(pod) && !roleExists(pod) {
+		log.Info("pod does not have a role label", "phase", dfi.df.Status.Phase)
+		master, err := getMaster(pods)
+		if err != nil {
+
+			if errors.Is(err, ErrNoMaster) {
+				log.Info("the master pod does not exist. Configuring replication...")
+			}
+
+			if errors.Is(err, ErrIncorrectMasters) {
+				//remove master pod label if it exists
+				// This is important as the pod termination could take a while in
+				// the deleted case causing unnecessary master reconcilation as 2 masters
+				// could exist at the same time.
+				if err = dfi.deleteMasterPodRoleLabel(ctx, pods); err != nil {
+					log.Error(err, "Failed to delete master role label.")
+					return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+				}
+			}
+
+			if err := dfi.configureReplication(ctx, pods); err != nil {
+				log.Error(err, "failed to configure replication.")
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 			}
 
-			r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Replication", "configured replication for first time")
-		} else if dfi.df.Status.Phase == PhaseReady {
-			// Pod event either from a restart or a resource update (i.e less/more replicas)
-			log.Info("Pod restart from a ready Dragonfly instance")
+			r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Replication", "Updated master instance")
 
-			// What should this pod be?
-			// If there is no active master, find and mark an healthy instance
-			// if there is an active master, mark it as a replica
-			// Check if there is an active master
-			exists, err := dfi.masterExists(ctx)
-			if err != nil {
-				log.Error(err, "could not check if active master exists")
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+		} else {
+			log.Info("the master exists. Configuring the replica...", "namespace", pod.Namespace, "pod", pod.Name, "ip", pod.Status.PodIP)
+
+			if err := dfi.configureReplica(ctx, &pod, master.Status.PodIP); err != nil {
+				log.Error(err, "failed to mark replica from db. retrying")
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 			}
 
-			if !exists {
-				log.Info("Master does not exist. Configuring Replication")
-				if err := dfi.configureReplication(ctx); err != nil {
-					log.Error(err, "couldn't find healthy and mark active")
-					return ctrl.Result{RequeueAfter: 5 * time.Second}, err
-				}
-
-				r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Replication", "Updated master instance")
-			} else {
-				log.Info(fmt.Sprintf("Master exists. Configuring %s as replica", pod.Status.PodIP))
-				if err := dfi.configureReplica(ctx, &pod); err != nil {
-					log.Error(err, "could not mark replica from db. retrying")
-					return ctrl.Result{RequeueAfter: 5 * time.Second}, err
-				}
-
-				r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Replication", "Configured a new replica")
-			}
+			r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Replication", "Configured a new replica")
 		}
-	} else if pod.DeletionTimestamp != nil {
+	}
+
+	if isPodMarkedForDeletion(pod) {
 		// pod deletion event
 		// configure replication if its a master pod
 		// do nothing if its a replica pod
-		log.Info("Pod is being deleted", "pod", fmt.Sprintf("%s/%s", pod.Namespace, pod.Name))
+		log.Info("pod is being deleted", "namespace", pod.Namespace, "pod", pod.Name)
 		// Check if there is an active master
-		if pod.Labels[resources.Role] == resources.Master {
+		if isMaster(pod) {
 			log.Info("master is being removed")
-			if dfi.df.Status.IsRollingUpdate {
+			if dfi.df.Status.Phase == PhaseRollingUpdate {
 				log.Info("rolling update in progress. nothing to do")
 				return ctrl.Result{}, nil
 			}
 
-			log.Info("master is being removed. configuring replication")
-			if err := dfi.configureReplication(ctx); err != nil {
-				log.Error(err, "couldn't find healthy and mark active")
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+			log.Info("master is being deleted. configuring replication")
+			if err := dfi.configureReplication(ctx, pods); err != nil {
+				log.Info("failed to reconfigure replication after master deletion", "error", err)
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 			}
 			r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Replication", "Updated master instance")
-		} else if pod.Labels[resources.Role] == resources.Replica {
+		} else if isReplica(pod) {
 			log.Info("replica is being deleted. nothing to do")
 		}
-	} else {
-		if dfi.df.Status.IsRollingUpdate {
+	}
+
+	if isPodReady(pod) && roleExists(pod) {
+		if dfi.df.Status.Phase == PhaseRollingUpdate {
 			log.Info("rolling update in progress. nothing to do")
 			return ctrl.Result{}, nil
 		}
 
 		// is something wrong? check if all pods have a matching role and revamp accordingly
-		log.Info("Non-deletion event for a pod with an existing role. checking if something is wrong", "pod", fmt.Sprintf("%s/%s", pod.Namespace, pod.Name), "role", role)
+		log.Info("non-deletion event for a pod with an existing role. checking if something is wrong", "namespace", pod.Namespace, "pod", pod.Name, "role", pod.Labels[resources.Role])
 
-		if err := dfi.checkAndConfigureReplication(ctx); err != nil {
-			log.Error(err, "could not check and configure replication. retrying")
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+		statefulSet, err := dfi.getStatefulSet(ctx)
+		if err != nil {
+			log.Error(err, "failed to get statefulset")
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+
+		if result, err := dfi.checkAndConfigureReplication(ctx, pods, statefulSet); !result.IsZero() || err != nil {
+			return result, err
 		}
 
 		r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Replication", "Checked and configured replication")

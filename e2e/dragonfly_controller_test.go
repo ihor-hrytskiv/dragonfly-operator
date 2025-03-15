@@ -486,7 +486,7 @@ var _ = Describe("Dragonfly Lifecycle tests", Ordered, FlakeAttempts(3), func() 
 				Namespace: namespace,
 			}, &df)
 			Expect(err).To(BeNil())
-			GinkgoLogr.Info("df arg propagate phase", "phase", df.Status.Phase, "rolling-update", df.Status.IsRollingUpdate)
+			GinkgoLogr.Info("df arg propagate phase", "phase", df.Status.Phase)
 
 		})
 
@@ -494,10 +494,13 @@ var _ = Describe("Dragonfly Lifecycle tests", Ordered, FlakeAttempts(3), func() 
 			stopChan := make(chan struct{}, 1)
 			defer close(stopChan)
 			rc, err := checkAndK8sPortForwardRedis(ctx, clientset, cfg, stopChan, name, namespace, password, 6395)
+			GinkgoLogr.Info("dragonfly phase", "phase", df.Status.Phase, "rc", rc, "error", err)
 			Expect(err).To(BeNil())
 
 			// Check for test data
 			data, err := rc.Get(ctx, "foo").Result()
+			GinkgoLogr.Info("dragonfly phase", "phase", df.Status.Phase, "data", data, "error", err)
+
 			Expect(err).To(BeNil())
 			Expect(data).To(Equal("bar"))
 		})
@@ -522,7 +525,7 @@ var _ = Describe("Dragonfly Lifecycle tests", Ordered, FlakeAttempts(3), func() 
 				Labels:      newLabels,
 			}
 
-			GinkgoLogr.Info("df phase", "phase", df.Status.Phase, "rolling-update", df.Status.IsRollingUpdate)
+			GinkgoLogr.Info("df phase", "phase", df.Status.Phase)
 			err = k8sClient.Update(ctx, &df)
 			Expect(err).To(BeNil())
 
@@ -943,17 +946,9 @@ func isDragonflyInphase(ctx context.Context, c client.Client, name, namespace, p
 		return false, nil
 	}
 
-	GinkgoLogr.Info("dragonfly phase", "phase", df.Status.Phase, "update", df.Status.IsRollingUpdate)
+	GinkgoLogr.Info("dragonfly phase", "phase", df.Status.Phase)
 
-	// Ready means we also want rolling update to be false
-	if phase == controller.PhaseReady {
-		// check for replicas
-		if df.Status.IsRollingUpdate {
-			return false, nil
-		}
-	}
-
-	if df.Status.Phase == phase {
+	if df.Status.Phase == controller.PhaseReady {
 		return true, nil
 	}
 
