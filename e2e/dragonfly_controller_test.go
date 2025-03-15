@@ -494,13 +494,10 @@ var _ = Describe("Dragonfly Lifecycle tests", Ordered, FlakeAttempts(3), func() 
 			stopChan := make(chan struct{}, 1)
 			defer close(stopChan)
 			rc, err := checkAndK8sPortForwardRedis(ctx, clientset, cfg, stopChan, name, namespace, password, 6395)
-			GinkgoLogr.Info("dragonfly phase", "phase", df.Status.Phase, "rc", rc, "error", err)
 			Expect(err).To(BeNil())
 
 			// Check for test data
 			data, err := rc.Get(ctx, "foo").Result()
-			GinkgoLogr.Info("dragonfly phase", "phase", df.Status.Phase, "data", data, "error", err)
-
 			Expect(err).To(BeNil())
 			Expect(data).To(Equal("bar"))
 		})
