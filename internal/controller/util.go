@@ -18,11 +18,15 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"net"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	"strconv"
 	"strings"
 
 	"github.com/dragonflydb/dragonfly-operator/internal/resources"
@@ -56,7 +60,7 @@ func isPodOnLatestVersion(pod *corev1.Pod, sts *appsv1.StatefulSet) bool {
 
 func isReplicaStable(ctx context.Context, pod *corev1.Pod) (bool, error) {
 	redisClient := redis.NewClient(&redis.Options{
-		Addr: fmt.Sprintf("%s:%d", pod.Status.PodIP, resources.DragonflyAdminPort),
+		Addr: net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(resources.DragonflyAdminPort)),
 	})
 	defer redisClient.Close()
 
@@ -107,6 +111,23 @@ func getGVK(obj client.Object, scheme *runtime.Scheme) schema.GroupVersionKind {
 	return gvk
 }
 
+func getMaster(pods *corev1.PodList) (*corev1.Pod, error) {
+	var master *corev1.Pod
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if isMaster(*pod) && isPodReady(*pod) {
+			if master != nil {
+				return nil, ErrIncorrectMasters
+			}
+			master = pod
+		}
+	}
+	if master == nil {
+		return nil, ErrNoMaster
+	}
+	return master, nil
+}
+
 // classifyPods classifies the given pods into master and replicas.
 func classifyPods(pods *corev1.PodList) (*corev1.Pod, []*corev1.Pod, error) {
 	var master *corev1.Pod
@@ -116,10 +137,11 @@ func classifyPods(pods *corev1.PodList) (*corev1.Pod, []*corev1.Pod, error) {
 		if isReplica(*pod) {
 			replicas = append(replicas, pod)
 		} else {
-			if isMaster(*pod) && master == nil {
+			if isMaster(*pod) {
+				if master != nil {
+					return nil, nil, ErrIncorrectMasters
+				}
 				master = pod
-			} else {
-				return nil, nil, ErrIncorrectMasters
 			}
 		}
 	}
@@ -127,7 +149,9 @@ func classifyPods(pods *corev1.PodList) (*corev1.Pod, []*corev1.Pod, error) {
 		return nil, nil, ErrNoMaster
 	}
 	if len(replicas) != len(pods.Items)-1 {
-		return nil, nil, ErrIncorrectReplicas
+		//TODO: remove
+		return master, replicas, ErrIncorrectReplicas
+		//return master, nil, ErrIncorrectReplicas
 	}
 	return master, replicas, nil
 }
@@ -139,6 +163,11 @@ func getReadyPod(pods *corev1.PodList) (*corev1.Pod, bool) {
 		}
 	}
 	return nil, false
+}
+
+func roleExists(pod corev1.Pod) bool {
+	_, ok := pod.Labels[resources.Role]
+	return ok
 }
 
 func isMaster(pod corev1.Pod) bool {
@@ -171,6 +200,15 @@ func isPodReady(pod corev1.Pod) bool {
 	return false
 }
 
+func isPodCrashLoopBackOff(pod corev1.Pod) bool {
+	for _, containerStatus := range pod.Status.ContainerStatuses {
+		if containerStatus.State.Waiting != nil && containerStatus.State.Waiting.Reason == "CrashLoopBackOff" {
+			return true
+		}
+	}
+	return false
+}
+
 func isDragonflyContainerReady(containerStatuses []corev1.ContainerStatus) bool {
 	for _, cs := range containerStatuses {
 		if cs.Name == resources.DragonflyContainerName && cs.Ready {
@@ -200,4 +238,13 @@ func isAllPodsReady(pods *corev1.PodList, sts *appsv1.StatefulSet) bool {
 		return true
 	}
 	return false
+}
+
+func createPatch(obj any) (client.Patch, error) {
+	patchBytes, err := json.Marshal(obj)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal patch object: %w", err)
+	}
+
+	return client.RawPatch(types.MergePatchType, patchBytes), nil
 }

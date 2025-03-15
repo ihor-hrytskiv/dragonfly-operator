@@ -22,9 +22,6 @@ import (
 	dfv1alpha1 "github.com/dragonflydb/dragonfly-operator/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -35,9 +32,7 @@ import (
 
 // DragonflyReconciler reconciles a Dragonfly object
 type DragonflyReconciler struct {
-	client.Client
-	Scheme        *runtime.Scheme
-	EventRecorder record.EventRecorder
+	Reconciler
 }
 
 //+kubebuilder:rbac:groups=dragonflydb.io,resources=dragonflies,verbs=get;list;watch;create;update;patch;delete
@@ -56,12 +51,13 @@ type DragonflyReconciler struct {
 func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
-	dfi, err := getDragonflyInstance(ctx, req.NamespacedName, r, log)
+	log.Info("reconciling dragonfly object")
+
+	dfi, err := r.getDragonflyInstance(ctx, req.NamespacedName, log)
 	if err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	log.Info("Reconciling Dragonfly object")
 	if result, err := dfi.ensureDragonflyResources(ctx); !result.IsZero() || err != nil {
 		return result, err
 	}
@@ -77,52 +73,35 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	switch dfi.df.Status.Phase {
-	case PhaseResourcesCreated:
-		if !isAllPodsReady(pods, statefulSet) {
-			log.Info("Waiting for all pods to be ready")
-			return ctrl.Result{Requeue: true}, nil
-		}
-
-		if _, _, err := classifyPods(pods); err != nil {
-			log.Error(err, "failed to classify pods as master and replicas")
-			return ctrl.Result{Requeue: true}, nil
-		} else {
-			dfi.log.Info("all pods are configured correctly", "dfi", dfi.df.Name)
-			// update status
-
-			if err := dfi.updateStatus(ctx, PhaseReady); err != nil {
-				if !apierrors.IsConflict(err) {
-					log.Error(err, "could not update the Dragonfly object")
-				}
-				return ctrl.Result{Requeue: true}, nil
-			}
-		}
 	case PhaseReady:
-		log.Info("Checking if pod spec has changed")
+		log.Info("checking if pod spec has changed")
 		// perform a rollout only if the pod spec has changed
 		// Check if the pod spec has changed
 		if dfi.isRollingUpdate(statefulSet, pods) {
-			log.Info("Pod spec has changed, performing a rollout")
+			log.Info("pod spec has changed, performing a rollout")
 			r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Rollout", "Starting a rollout")
 
 			// Start rollout and update status
 			// update status so that we can track progress
-			if err := dfi.updateStatus(ctx, PhaseRollingUpdate); err != nil {
-				if !apierrors.IsConflict(err) {
-					log.Error(err, "could not update the Dragonfly object")
-				}
+			if err := dfi.patchStatusPhase(ctx, PhaseRollingUpdate); err != nil {
+				log.Error(err, "failed to update the dragonfly object")
+
 				return ctrl.Result{Requeue: true}, nil
 			}
 
 			r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Resources", "Performing a rollout")
-			return ctrl.Result{Requeue: true}, nil
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 	case PhaseRollingUpdate:
 		// This is a Rollout
 		log.Info("Rolling out new version")
 
+		if result, err := dfi.deleteCrashLoopBackOff(ctx, pods, statefulSet); !result.IsZero() || err != nil {
+			return result, err
+		}
+
 		if !isAllPodsReady(pods, statefulSet) {
-			log.Info("Waiting for all replicas to be ready")
+			log.Info("Waiting for all pods to be ready")
 			return ctrl.Result{Requeue: true}, nil
 		}
 
@@ -151,23 +130,35 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if !isPodOnLatestVersion(master, statefulSet) {
 			// Update master now
 			if len(replicas) > 0 {
-				replica, err := dfi.getLatestReplica(ctx, statefulSet)
-				if replica == nil || err != nil {
-					log.Error(err, "could not get latest replica")
+				newMaster, err := dfi.getLatestReplica(statefulSet, replicas)
+				if err != nil {
+					log.Error(err, "failed to get latest replica")
 					return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 				}
-				log.Info("Running REPLTAKEOVER on replica", "pod", master.Name)
-				if err := dfi.replTakeover(ctx, replica); err != nil {
-					log.Error(err, "could not update master")
+
+				log.Info("running REPLTAKEOVER on replica", "pod", newMaster.Name)
+
+				if err := dfi.replTakeover(ctx, newMaster); err != nil {
+					log.Error(err, "failed to update master")
 					return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+				}
+				for _, replica := range replicas {
+					if replica.Name != newMaster.Name && isPodReady(*replica) {
+						dfi.log.Info("configuring pod as replica to the right master", "pod", replica.Name)
+						if err := dfi.configureReplica(ctx, replica, newMaster.Status.PodIP); err != nil {
+							dfi.log.Error(err, "failed to mark replica from db. retrying")
+							return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+						}
+					}
 				}
 			}
+
 			r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Rollout", fmt.Sprintf("Shutting down master %s", master.Name))
 
 			// delete the old master, so that it gets recreated with the new version
 			log.Info("deleting master", "pod", master.Name)
-			if err := r.Delete(ctx, master); err != nil {
-				log.Error(err, "could not delete pod")
+			if err := r.Client.Delete(ctx, master); err != nil {
+				log.Error(err, "failed to delete pod")
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 			}
 		}
@@ -176,10 +167,9 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Rollout", "Completed")
 
 		// update status
-		if err := dfi.updateStatus(ctx, PhaseReady); err != nil {
-			if !apierrors.IsConflict(err) {
-				log.Error(err, "could not update the Dragonfly object")
-			}
+		if err := dfi.patchStatusPhase(ctx, PhaseReady); err != nil {
+			log.Error(err, "failed to update the dragonfly object")
+
 			return ctrl.Result{Requeue: true}, nil
 		}
 
@@ -188,12 +178,6 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	return ctrl.Result{}, nil
 }
-
-func (r *DragonflyReconciler) GetClient() client.Client { return r.Client }
-
-func (r *DragonflyReconciler) GetEventRecorder() record.EventRecorder { return r.EventRecorder }
-
-func (r *DragonflyReconciler) GetScheme() *runtime.Scheme { return r.Scheme }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *DragonflyReconciler) SetupWithManager(mgr ctrl.Manager) error {
