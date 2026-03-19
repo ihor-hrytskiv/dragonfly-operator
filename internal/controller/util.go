@@ -19,6 +19,7 @@ package controller
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/dragonflydb/dragonfly-operator/internal/resources"
 	appsv1 "k8s.io/api/apps/v1"
@@ -82,9 +83,13 @@ func isRunningAndReady(pod *corev1.Pod) bool {
 }
 
 // isReady returns true if the pod and the dragonfly container are ready.
+// Uses ContainersReady instead of PodReady so the operator can act on pods
+// whose custom readiness gates (e.g. dragonflydb.io/replication-ready) have
+// not been satisfied yet. ContainersReady is set by the kubelet based solely
+// on container readiness probes and is unaffected by readiness gates.
 func isReady(pod *corev1.Pod) bool {
 	for _, c := range pod.Status.Conditions {
-		if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue && pod.Status.PodIP != "" {
+		if c.Type == corev1.ContainersReady && c.Status == corev1.ConditionTrue && pod.Status.PodIP != "" {
 			return isDragonflyContainerReady(pod.Status.ContainerStatuses)
 		}
 	}
@@ -172,4 +177,9 @@ func isMasterError(err error) bool {
 	return errors.Is(err, ErrNoMaster) ||
 		errors.Is(err, ErrNoHealthyMaster) ||
 		errors.Is(err, ErrIncorrectMasters)
+}
+
+// sanitizeIp removes surrounding brackets from IPv6 addresses.
+func sanitizeIp(masterIp string) string {
+	return strings.Trim(masterIp, "[]")
 }

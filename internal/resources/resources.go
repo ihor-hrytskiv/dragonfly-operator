@@ -22,6 +22,7 @@ import (
 	resourcesv1 "github.com/dragonflydb/dragonfly-operator/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -34,12 +35,16 @@ var (
 
 // GenerateDragonflyResources returns the resources required for a Dragonfly
 // Instance
-func GenerateDragonflyResources(df *resourcesv1.Dragonfly) ([]client.Object, error) {
+func GenerateDragonflyResources(df *resourcesv1.Dragonfly, defaultDragonflyImage string) ([]client.Object, error) {
 	var resources []client.Object
 
 	image := df.Spec.Image
 	if image == "" {
-		image = fmt.Sprintf("%s:%s", DragonflyImage, Version)
+		if defaultDragonflyImage != "" {
+			image = defaultDragonflyImage
+		} else {
+			image = fmt.Sprintf("%s:%s", DragonflyImage, Version)
+		}
 	}
 
 	// Create a StatefulSet, Headless Service
@@ -139,6 +144,12 @@ func GenerateDragonflyResources(df *resourcesv1.Dragonfly) ([]client.Object, err
 		},
 	}
 
+	if df.Spec.EnableReplicationReadinessGate {
+		statefulset.Spec.Template.Spec.ReadinessGates = []corev1.PodReadinessGate{
+			{ConditionType: corev1.PodConditionType(ReplicationReadyConditionType)},
+		}
+	}
+
 	if len(df.Spec.InitContainers) > 0 {
 		statefulset.Spec.Template.Spec.InitContainers = df.Spec.InitContainers
 	}
@@ -231,8 +242,13 @@ func GenerateDragonflyResources(df *resourcesv1.Dragonfly) ([]client.Object, err
 	}
 
 	if df.Spec.Snapshot != nil {
+		// validate mutual exclusivity of PVC spec and existing PVC name
+		if df.Spec.Snapshot.PersistentVolumeClaimSpec != nil && df.Spec.Snapshot.ExistingPersistentVolumeClaimName != "" {
+			return nil, fmt.Errorf("persistentVolumeClaimSpec and existingPersistentVolumeClaimName are mutually exclusive")
+		}
+
 		// err if pvc is not specified & s3 sir is not present while cron is specified
-		if df.Spec.Snapshot.Cron != "" && df.Spec.Snapshot.PersistentVolumeClaimSpec == nil && df.Spec.Snapshot.Dir == "" {
+		if df.Spec.Snapshot.Cron != "" && df.Spec.Snapshot.PersistentVolumeClaimSpec == nil && df.Spec.Snapshot.ExistingPersistentVolumeClaimName == "" && df.Spec.Snapshot.Dir == "" {
 			return nil, fmt.Errorf("cron specified without a persistent volume claim")
 		}
 
@@ -253,6 +269,23 @@ func GenerateDragonflyResources(df *resourcesv1.Dragonfly) ([]client.Object, err
 					},
 				},
 				Spec: *df.Spec.Snapshot.PersistentVolumeClaimSpec,
+			})
+
+			statefulset.Spec.Template.Spec.Containers[0].VolumeMounts = append(statefulset.Spec.Template.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{
+				Name:      SnapshotsVolumeName,
+				MountPath: snapshotDir,
+			})
+		}
+
+		if df.Spec.Snapshot.ExistingPersistentVolumeClaimName != "" {
+			// use an existing PVC
+			statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, corev1.Volume{
+				Name: SnapshotsVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+						ClaimName: df.Spec.Snapshot.ExistingPersistentVolumeClaimName,
+					},
+				},
 			})
 
 			statefulset.Spec.Template.Spec.Containers[0].VolumeMounts = append(statefulset.Spec.Template.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{
@@ -445,10 +478,6 @@ func GenerateDragonflyResources(df *resourcesv1.Dragonfly) ([]client.Object, err
 			Annotations: generateResourceAnnotations(df),
 		},
 		Spec: policyv1.PodDisruptionBudgetSpec{
-			MaxUnavailable: &intstr.IntOrString{
-				Type:   intstr.Int,
-				IntVal: 1,
-			},
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
 					DragonflyNameLabelKey:     df.Name,
@@ -459,11 +488,113 @@ func GenerateDragonflyResources(df *resourcesv1.Dragonfly) ([]client.Object, err
 		},
 	}
 
+	// Apply custom PDB configuration
+	if df.Spec.Pdb == nil || (df.Spec.Pdb.MaxUnavailable == nil && df.Spec.Pdb.MinAvailable == nil) {
+		pdb.Spec.MaxUnavailable = &intstr.IntOrString{
+			Type:   intstr.Int,
+			IntVal: 1,
+		}
+	} else if df.Spec.Pdb.MaxUnavailable != nil {
+		pdb.Spec.MaxUnavailable = df.Spec.Pdb.MaxUnavailable
+	} else if df.Spec.Pdb.MinAvailable != nil {
+		pdb.Spec.MinAvailable = df.Spec.Pdb.MinAvailable
+	}
+
 	if df.Spec.Replicas > 1 {
 		resources = append(resources, &pdb)
 	}
 
+	if isNetworkPolicyEnabled(df) {
+		np := generateNetworkPolicy(df)
+		resources = append(resources, &np)
+	}
+
 	return resources, nil
+}
+
+func isNetworkPolicyEnabled(df *resourcesv1.Dragonfly) bool {
+	return df.Spec.NetworkPolicyEnabled == nil || *df.Spec.NetworkPolicyEnabled
+}
+
+func generateNetworkPolicy(df *resourcesv1.Dragonfly) networkingv1.NetworkPolicy {
+	protocolTCP := corev1.ProtocolTCP
+
+	instanceSelector := map[string]string{
+		DragonflyNameLabelKey:     df.Name,
+		KubernetesPartOfLabelKey:  KubernetesPartOf,
+		KubernetesAppNameLabelKey: KubernetesAppName,
+	}
+
+	clientPortRule := networkingv1.NetworkPolicyIngressRule{
+		Ports: []networkingv1.NetworkPolicyPort{
+			{
+				Protocol: &protocolTCP,
+				Port:     &intstr.IntOrString{Type: intstr.Int, IntVal: DragonflyPort},
+			},
+		},
+	}
+
+	adminPortRule := networkingv1.NetworkPolicyIngressRule{
+		Ports: []networkingv1.NetworkPolicyPort{
+			{
+				Protocol: &protocolTCP,
+				Port:     &intstr.IntOrString{Type: intstr.Int, IntVal: DragonflyAdminPort},
+			},
+		},
+		From: []networkingv1.NetworkPolicyPeer{
+			{
+				PodSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						OperatorControlPlaneLabelKey: OperatorControlPlaneLabelValue,
+					},
+				},
+				NamespaceSelector: &metav1.LabelSelector{},
+			},
+			{
+				PodSelector: &metav1.LabelSelector{
+					MatchLabels: instanceSelector,
+				},
+			},
+		},
+	}
+
+	ingressRules := []networkingv1.NetworkPolicyIngressRule{clientPortRule, adminPortRule}
+
+	if df.Spec.MemcachedPort != 0 {
+		memcachedPortRule := networkingv1.NetworkPolicyIngressRule{
+			Ports: []networkingv1.NetworkPolicyPort{
+				{
+					Protocol: &protocolTCP,
+					Port:     &intstr.IntOrString{Type: intstr.Int, IntVal: df.Spec.MemcachedPort},
+				},
+			},
+		}
+		ingressRules = append(ingressRules, memcachedPortRule)
+	}
+
+	return networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      df.Name,
+			Namespace: df.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: df.APIVersion,
+					Kind:       df.Kind,
+					Name:       df.Name,
+					UID:        df.UID,
+				},
+			},
+			Labels:      generateResourceLabels(df),
+			Annotations: generateResourceAnnotations(df),
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{
+				MatchLabels: instanceSelector,
+			},
+			Ingress:     ingressRules,
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+		},
+	}
 }
 
 // mergeNamedSlices will merge base into override, override takes precendence

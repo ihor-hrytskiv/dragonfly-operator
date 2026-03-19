@@ -13,10 +13,17 @@ crds:
 
 nameOverride: ""
 fullnameOverride: ""
+namespaceOverride: ""
+
+# -- Default dragonfly image to use
+dragonflyImage: ""
 
 # -- Additional labels to add to all resources
 additionalLabels: {}
   # app: dragonfly-operator
+
+# -- Create aggregated cluster roles for view, edit, and admin
+createAggregateRoles: true
 
 serviceAccount:
   # Specifies whether a service account should be created
@@ -34,6 +41,12 @@ podAnnotations:
 
 podLabels: {}
 
+# Additional annotations to add to deployments
+deploymentAnnotations: {}
+
+# Additional labels to add to deployments
+deploymentLabels: {}
+
 podSecurityContext:
   runAsNonRoot: true
 
@@ -50,7 +63,7 @@ rbacProxy:
     repository: quay.io/brancz/kube-rbac-proxy
     pullPolicy: IfNotPresent
     # Overrides the image tag whose default is the chart appVersion.
-    tag: v0.13.1
+    tag: v0.20.2
 
   extraArgs: {}
 
@@ -160,6 +173,16 @@ serviceMonitor:
   #     replacement: mydbname
   #     targetLabel: dbname
 
+  # When rbacProxy is enabled, a ClusterRoleBinding is needed to grant the
+  # Prometheus service account access to the /metrics endpoint via kube-rbac-proxy.
+  rbacProxyMetricsReader:
+    # -- Create a ClusterRoleBinding for the Prometheus service account
+    create: false
+    # -- Name of the Prometheus ServiceAccount
+    serviceAccountName: ""
+    # -- Namespace of the Prometheus ServiceAccount
+    serviceAccountNamespace: ""
+  
 grafanaDashboard:
   enabled: false
   folder: database
